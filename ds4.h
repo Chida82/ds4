@@ -65,6 +65,14 @@ typedef struct {
     const char *directional_steering_file;
     float directional_steering_attn;
     float directional_steering_ffn;
+    /* Expert (de)activation steering (SteerMoE).  When a file is provided and
+     * the scale is nonzero, an additive bias of size [n_layer * n_expert] is
+     * added to the routed-MoE selection scores at every routed (non-hash)
+     * layer.  Positive entries promote experts (force-activate when the bias
+     * dominates), negative entries suppress them (force-deactivate).  See
+     * expert-steering/README.md and EXPERT_STEERING.md. */
+    const char *expert_steering_file;
+    float expert_steering_scale;
     bool warm_weights;
     bool quality;
 } ds4_engine_options;

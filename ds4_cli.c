@@ -109,6 +109,10 @@ static void usage(FILE *fp) {
         "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
         "  --dir-steering-attn F\n"
         "      Apply steering after attention outputs. Default: 0\n"
+        "  --expert-steering-file FILE\n"
+        "      Load a per-(layer, expert) f32 bias for the routed-MoE selection score (SteerMoE).\n"
+        "  --expert-steering-scale F\n"
+        "      Multiplier on the file values. Soft steering ~1; hard force-on/off ~1e6. Default with file: 1\n"
         "  --warm-weights\n"
         "      Touch mapped tensor pages before generation. Slower startup, fewer first-use stalls.\n"
         "\n"
@@ -1204,6 +1208,7 @@ static cli_config parse_options(int argc, char **argv) {
     };
 
     bool directional_steering_scale_set = false;
+    bool expert_steering_scale_set = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -1252,6 +1257,11 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dir-steering-attn")) {
             c.engine.directional_steering_attn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--expert-steering-file")) {
+            c.engine.expert_steering_file = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--expert-steering-scale")) {
+            c.engine.expert_steering_scale = parse_float_range(need_arg(&i, argc, argv, arg), arg, -1.0e9f, 1.0e9f);
+            expert_steering_scale_set = true;
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
             c.engine.n_threads = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--backend")) {
@@ -1315,6 +1325,9 @@ static cli_config parse_options(int argc, char **argv) {
 
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
+    }
+    if (c.engine.expert_steering_file && !expert_steering_scale_set) {
+        c.engine.expert_steering_scale = 1.0f;
     }
     if (c.gen.imatrix_output_path && !c.gen.imatrix_dataset_path) {
         fprintf(stderr, "ds4: --imatrix-out requires --imatrix-dataset\n");

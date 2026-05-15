@@ -85,6 +85,7 @@ struct ds4_metal_args_dsv4_router_select_one {
     uint32_t use_token_buffer;
     uint32_t token;
     uint32_t hash_rows;
+    uint32_t has_steering;
 };
 
 struct ds4_metal_args_dsv4_directional_steering_project {
@@ -228,6 +229,7 @@ kernel void kernel_dsv4_router_finalize_one(
         device const int32_t *hash,
         device const int32_t *tokens,
         device int32_t *selected,
+        device const float *steering,
         threadgroup float *scratch [[threadgroup(0)]],
         uint tid [[thread_position_in_threadgroup]]) {
     if (tid >= 256) return;
@@ -235,7 +237,9 @@ kernel void kernel_dsv4_router_finalize_one(
     threadgroup float *sel_scores = scratch;
     threadgroup int32_t *idx = (threadgroup int32_t *)(scratch + 256);
     const float p = probs[tid];
-    sel_scores[tid] = args.has_bias ? p + bias[tid] : p;
+    float s = args.has_bias ? p + bias[tid] : p;
+    if (args.has_steering) s += steering[tid];
+    sel_scores[tid] = s;
     idx[tid] = (int32_t)tid;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

@@ -597,7 +597,12 @@ int ds4_gpu_router_select_tensor(
         uint32_t                n_group_used,
         bool                    has_bias,
         bool                    hash_mode,
-        const ds4_gpu_tensor *logits);
+        const ds4_gpu_tensor *logits,
+        /* SteerMoE: optional [n_layer * 256] f32 bias (per-expert additive
+         * adjustment of the routed-MoE selection score).  Pass NULL for no
+         * steering; expert_steering_layer selects the active layer slice. */
+        const ds4_gpu_tensor *expert_steering_bias,
+        uint32_t                expert_steering_layer);
 
 int ds4_gpu_router_select_batch_tensor(
         ds4_gpu_tensor       *selected,
@@ -614,7 +619,9 @@ int ds4_gpu_router_select_batch_tensor(
         bool                    hash_mode,
         const ds4_gpu_tensor *logits,
         const ds4_gpu_tensor *tokens,
-        uint32_t                n_tokens);
+        uint32_t                n_tokens,
+        const ds4_gpu_tensor *expert_steering_bias,
+        uint32_t                expert_steering_layer);
 
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,

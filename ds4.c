@@ -5224,23 +5224,27 @@ static void topk_desc(const float *score, int n, int k, int *idx) {
 
 /* Later layers choose the six experts by biased top-k, but weight them using
  * the unbiased router probabilities. */
+static const float *expert_steering_layer_bias(uint32_t il);
+
 static void layer_topk_selected_experts_from_probs(
         int                    selected[DS4_N_EXPERT_USED],
         float                  expert_weight[DS4_N_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
-        const float           probs[DS4_N_EXPERT]);
+        const float           probs[DS4_N_EXPERT],
+        uint32_t              il);
 
 static void layer_topk_selected_experts(
         int                    selected[DS4_N_EXPERT_USED],
         float                  expert_weight[DS4_N_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
-        const float           *x) {
+        const float           *x,
+        uint32_t              il) {
     float probs[DS4_N_EXPERT];
 
     layer_router_probs_one(probs, model, layer, x);
-    layer_topk_selected_experts_from_probs(selected, expert_weight, model, layer, probs);
+    layer_topk_selected_experts_from_probs(selected, expert_weight, model, layer, probs, il);
 }
 
 static void layer_topk_selected_experts_from_probs(
@@ -5248,7 +5252,8 @@ static void layer_topk_selected_experts_from_probs(
         float                  expert_weight[DS4_N_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
-        const float           probs[DS4_N_EXPERT]) {
+        const float           probs[DS4_N_EXPERT],
+        uint32_t              il) {
     float selection[DS4_N_EXPERT];
 
     memcpy(selection, probs, sizeof(selection));
@@ -5256,6 +5261,15 @@ static void layer_topk_selected_experts_from_probs(
     if (layer->ffn_exp_probs_b) {
         const float *bias = tensor_data(model, layer->ffn_exp_probs_b);
         for (int i = 0; i < DS4_N_EXPERT; i++) selection[i] += bias[i];
+    }
+
+    /* SteerMoE: optional per-expert additive bias on the selection score for
+     * this layer.  Promotes (+) or suppresses (-) experts before the top-k cut,
+     * while the weighting below still uses the unbiased router probabilities,
+     * matching the paper's "soft" steering rule. */
+    const float *steering_bias = expert_steering_layer_bias(il);
+    if (steering_bias) {
+        for (int i = 0; i < DS4_N_EXPERT; i++) selection[i] += steering_bias[i];
     }
 
     topk_desc(selection, DS4_N_EXPERT, DS4_N_EXPERT_USED, selected);
@@ -5305,7 +5319,7 @@ static void layer_routed_moe_one(
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, x, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, x, il);
     }
 
     if (!trace) {
@@ -5399,7 +5413,7 @@ static void layer_routed_moe_one_prealloc(
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, x, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, x, il);
     }
 
     matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
@@ -5465,7 +5479,7 @@ static void layer_routed_moe_batch(
             layer_hash_selected_experts(sel, model, layer, token_ids[t]);
             layer_hash_router_weights_one(weights, model, layer, norm + (uint64_t)t * expert_in_dim, sel);
         } else {
-            layer_topk_selected_experts(sel, weights, model, layer, norm + (uint64_t)t * expert_in_dim);
+            layer_topk_selected_experts(sel, weights, model, layer, norm + (uint64_t)t * expert_in_dim, il);
         }
 
         for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
@@ -8213,12 +8227,16 @@ typedef struct {
     ds4_gpu_tensor *directional_steering_dirs;
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
+    /* SteerMoE: optional per-(layer, expert) additive bias for the routed-MoE
+     * top-k selection score, pre-multiplied by the user's scale. */
+    ds4_gpu_tensor *expert_steering_bias;
     bool quality;
     bool mtp_enabled;
 } ds4_gpu_graph;
 
 /* Release every Metal tensor owned by the whole-model graph runtime. */
 static void metal_graph_free(ds4_gpu_graph *g) {
+    ds4_gpu_tensor_free(g->expert_steering_bias);
     ds4_gpu_tensor_free(g->directional_steering_dirs);
     ds4_gpu_tensor_free(g->batch_ffn_out);
     ds4_gpu_tensor_free(g->batch_routed_out);
@@ -8400,6 +8418,27 @@ static bool metal_graph_load_directional_steering(
     g->directional_steering_ffn_scale = ffn_scale;
     fprintf(stderr, "ds4: directional steering enabled: %s attn=%g ffn=%g\n",
             path, (double)attn_scale, (double)ffn_scale);
+    return true;
+}
+
+/* SteerMoE: upload the (already scale-multiplied) per-(layer, expert) selection
+ * bias into a Metal tensor that lives for the whole graph lifetime.  When the
+ * engine has no expert steering loaded the tensor stays NULL and the router
+ * select call sites pass NULL through, leaving the unmodified routing path. */
+static bool metal_graph_load_expert_steering(
+        ds4_gpu_graph *g,
+        const float    *bias) {
+    if (!g || !bias) return true;
+    const uint64_t n = (uint64_t)DS4_N_LAYER * DS4_N_EXPERT;
+    g->expert_steering_bias = ds4_gpu_tensor_alloc(n * sizeof(float));
+    if (!g->expert_steering_bias) {
+        fprintf(stderr, "ds4: failed to allocate Metal expert steering buffer\n");
+        return false;
+    }
+    if (ds4_gpu_tensor_write(g->expert_steering_bias, 0, bias, n * sizeof(float)) == 0) {
+        fprintf(stderr, "ds4: failed to upload expert steering bias to Metal\n");
+        return false;
+    }
     return true;
 }
 
@@ -9737,7 +9776,9 @@ static bool metal_graph_encode_decode_layer(
                                                 0,
                                                 layer->ffn_exp_probs_b != NULL,
                                                 layer->ffn_gate_tid2eid != NULL,
-                                                g->router_logits) != 0;
+                                                g->router_logits,
+                                                (g->expert_steering_bias && !layer->ffn_gate_tid2eid) ? g->expert_steering_bias : NULL,
+                                                il) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE("router");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", g->router_logits, DS4_N_EXPERT, il, pos);
@@ -10185,7 +10226,7 @@ static void metal_graph_trace_layer_stages(
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm, il);
     }
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) cpu_ffn_out[i] = cpu_shared[i] + cpu_routed[i];
     hc_post_one(cpu_after_ffn_hc, cpu_ffn_out, cpu_after_attn_hc, ffn_post, ffn_comb, DS4_N_EMBD, DS4_N_HC);
@@ -10409,7 +10450,7 @@ static int metal_graph_decode_test(
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm, 0);
     }
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) cpu_ffn_out[i] = cpu_shared[i] + cpu_routed[i];
     hc_post_one(cpu_after_ffn_hc,
@@ -12480,7 +12521,9 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                       layer->ffn_gate_tid2eid != NULL,
                                                       g->batch_router_logits,
                                                       g->prefill_tokens,
-                                                      n_tokens) != 0;
+                                                      n_tokens,
+                                                      (g->expert_steering_bias && !layer->ffn_gate_tid2eid) ? g->expert_steering_bias : NULL,
+                                                      il) != 0;
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_logits", g->batch_router_logits,
                                       (uint64_t)n_tokens * DS4_N_EXPERT, il, pos0);
@@ -14247,6 +14290,13 @@ struct ds4_engine {
     float *directional_steering_dirs;
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
+    /* Expert steering (SteerMoE): additive bias added to routed-MoE selection
+     * scores per (layer, expert) pair.  bias has shape [DS4_N_LAYER *
+     * DS4_N_EXPERT] f32 and is already pre-multiplied by the user-provided
+     * scale.  Hash-routed layers (il < DS4_N_HASH_LAYER) ignore steering. */
+    char *expert_steering_file;
+    float *expert_steering_bias;
+    float expert_steering_scale;
     bool quality;
     bool metal_ready;
     bool mtp_ready;
@@ -14256,6 +14306,24 @@ static bool cpu_directional_steering_enabled(
         const float *dirs,
         float        scale) {
     return dirs && scale != 0.0f;
+}
+
+/* SteerMoE active-engine global.  The instance lock guarantees a single open
+ * engine at a time, so this lookup is unambiguous and avoids threading the
+ * steering pointer through every CPU forward function.  expert_steering_set()
+ * is called from ds4_engine_open() once the bias is loaded, and reset to NULL
+ * from ds4_engine_close(). */
+static const float *g_expert_steering_bias = NULL;
+
+static void expert_steering_set(const float *bias) {
+    g_expert_steering_bias = bias;
+}
+
+static const float *expert_steering_layer_bias(uint32_t il) {
+    if (!g_expert_steering_bias) return NULL;
+    if (il < DS4_N_HASH_LAYER) return NULL;     /* hash-routed layers */
+    if (il >= DS4_N_LAYER) return NULL;
+    return g_expert_steering_bias + (uint64_t)il * DS4_N_EXPERT;
 }
 
 static void cpu_directional_steering_project_rows(
@@ -14305,6 +14373,49 @@ static bool cpu_load_directional_steering(ds4_engine *e) {
             path,
             (double)e->directional_steering_attn_scale,
             (double)e->directional_steering_ffn_scale);
+    return true;
+}
+
+/* Expert steering (SteerMoE) loader.
+ *
+ * The file is a flat 32-bit float matrix [DS4_N_LAYER * DS4_N_EXPERT].  Each
+ * entry is the additive bias to apply to the routed-MoE selection score for
+ * (layer, expert) before the top-k pick.  Positive values promote the expert
+ * (force-activate when very large), negative values suppress it.  The user
+ * scale multiplies every entry; a scale near 1 keeps steering soft, very large
+ * scales (e.g. 1e6) approximate hard force-on/force-off.
+ *
+ * The file is shared across CPU and Metal paths.  Hash-routed layers (the
+ * first DS4_N_HASH_LAYER layers) are unaffected: their experts come from a
+ * fixed token->expert table, not the router. */
+static bool ds4_engine_load_expert_steering(ds4_engine *e) {
+    if (!e || e->expert_steering_scale == 0.0f) return true;
+    const char *path = e->expert_steering_file;
+    if (!path || !path[0]) {
+        fprintf(stderr, "ds4: expert steering needs --expert-steering-file\n");
+        return false;
+    }
+    const uint64_t n = (uint64_t)DS4_N_LAYER * DS4_N_EXPERT;
+    float *raw = xmalloc((size_t)n * sizeof(raw[0]));
+    if (!read_f32_binary_file(path, raw, n)) {
+        free(raw);
+        fprintf(stderr, "ds4: failed to load expert steering bias from %s "
+                        "(expected %llu f32 entries = %llu bytes)\n",
+                path,
+                (unsigned long long)n,
+                (unsigned long long)(n * sizeof(float)));
+        return false;
+    }
+    e->expert_steering_bias = xmalloc((size_t)n * sizeof(e->expert_steering_bias[0]));
+    for (uint64_t i = 0; i < n; i++) {
+        e->expert_steering_bias[i] = raw[i] * e->expert_steering_scale;
+    }
+    free(raw);
+    fprintf(stderr, "ds4: expert steering enabled: %s scale=%g (routed layers %u..%u)\n",
+            path,
+            (double)e->expert_steering_scale,
+            (unsigned)DS4_N_HASH_LAYER,
+            (unsigned)(DS4_N_LAYER - 1));
     return true;
 }
 
@@ -17040,6 +17151,17 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         e->directional_steering_attn_scale = opt->directional_steering_attn;
         e->directional_steering_ffn_scale = opt->directional_steering_ffn;
     }
+    if (opt->expert_steering_scale != 0.0f &&
+        (!opt->expert_steering_file || !opt->expert_steering_file[0])) {
+        fprintf(stderr, "ds4: expert steering needs --expert-steering-file\n");
+        free(e);
+        *out = NULL;
+        return 1;
+    }
+    if (opt->expert_steering_file && opt->expert_steering_file[0]) {
+        e->expert_steering_file = ds4_strdup(opt->expert_steering_file);
+        e->expert_steering_scale = opt->expert_steering_scale != 0.0f ? opt->expert_steering_scale : 1.0f;
+    }
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
 
@@ -17054,6 +17176,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         *out = NULL;
         return 1;
     }
+    if (!ds4_engine_load_expert_steering(e)) {
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+    expert_steering_set(e->expert_steering_bias);
     if (opt->mtp_path && opt->mtp_path[0]) {
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
@@ -17157,6 +17285,9 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_gpu_cleanup();
 #endif
     ds4_release_instance_lock();
+    expert_steering_set(NULL);
+    free(e->expert_steering_bias);
+    free(e->expert_steering_file);
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
     free(e);
@@ -17196,6 +17327,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                                e->directional_steering_file,
                                                e->directional_steering_attn_scale,
                                                e->directional_steering_ffn_scale)) {
+        metal_graph_free(&s->graph);
+        free(s);
+        return 1;
+    }
+    if (!metal_graph_load_expert_steering(&s->graph, e->expert_steering_bias)) {
         metal_graph_free(&s->graph);
         free(s);
         return 1;

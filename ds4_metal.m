@@ -2605,6 +2605,7 @@ typedef struct {
     uint32_t use_token_buffer;
     uint32_t token;
     uint32_t hash_rows;
+    uint32_t has_steering;
 } ds4_gpu_dsv4_router_select_one_args;
 
 typedef struct {
@@ -12302,7 +12303,9 @@ static int ds4_gpu_encode_router_select(
         uint32_t              hash_rows,
         uint32_t              n_tokens,
         bool                  has_bias,
-        bool                  hash_mode) {
+        bool                  hash_mode,
+        id<MTLBuffer>         steeringbuf,
+        NSUInteger            steering_off) {
     id<MTLBuffer> selectedbuf = ds4_gpu_tensor_buffer(selected);
     id<MTLBuffer> weightsbuf = ds4_gpu_tensor_buffer(weights);
     id<MTLBuffer> probsbuf = ds4_gpu_tensor_buffer(probs);
@@ -12342,12 +12345,14 @@ static int ds4_gpu_encode_router_select(
         if (!ok) return 0;
 
         const bool use_token_buffer = single_token == NULL;
+        const bool has_steering = steeringbuf != nil;
         ds4_gpu_dsv4_router_select_one_args args = {
             .has_bias = has_bias ? 1u : 0u,
             .hash_mode = hash_mode ? 1u : 0u,
             .use_token_buffer = use_token_buffer ? 1u : 0u,
             .token = single_token ? (uint32_t)*single_token : 0u,
             .hash_rows = hash_rows,
+            .has_steering = has_steering ? 1u : 0u,
         };
 
         const float zero_f32 = 0.0f;
@@ -12378,6 +12383,11 @@ static int ds4_gpu_encode_router_select(
             [enc setBytes:&zero_i32 length:sizeof(zero_i32) atIndex:4];
         }
         [enc setBuffer:selectedbuf offset:selected_off atIndex:5];
+        if (has_steering) {
+            [enc setBuffer:steeringbuf offset:steering_off atIndex:6];
+        } else {
+            [enc setBytes:&zero_f32 length:sizeof(zero_f32) atIndex:6];
+        }
         [enc setThreadgroupMemoryLength:256u * sizeof(float) + 256u * sizeof(int32_t) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -12458,27 +12468,53 @@ static int ds4_gpu_encode_router_select(
     } else {
         ds4_gpu_tensor *score_tensor = probs;
         DS4MetalTensor *selection_view = nil;
+        const bool has_steering = steeringbuf != nil;
 
-        if (has_bias) {
-            if (!biasbuf ||
-                !ds4_gpu_ensure_scratch_buffer(&g_router_selection_buffer,
+        if (has_bias || has_steering) {
+            if (!ds4_gpu_ensure_scratch_buffer(&g_router_selection_buffer,
                                                  &g_router_selection_bytes,
                                                  probs_bytes,
                                                  "ds4_router_selection")) {
                 return 0;
             }
+            if (has_bias && !biasbuf) return 0;
 
             ds4_gpu_bin_args add_args = ds4_gpu_make_bin_rows_args(256, n_tokens, 256);
-            ok = ds4_gpu_encode_bin_f32_rows(cb,
-                                               g_add_pipeline,
-                                               &add_args,
-                                               probsbuf,
-                                               probs_off,
-                                               biasbuf,
-                                               bias_off,
-                                               g_router_selection_buffer,
-                                               0);
-            if (!ok) return 0;
+            if (has_bias) {
+                ok = ds4_gpu_encode_bin_f32_rows(cb,
+                                                   g_add_pipeline,
+                                                   &add_args,
+                                                   probsbuf,
+                                                   probs_off,
+                                                   biasbuf,
+                                                   bias_off,
+                                                   g_router_selection_buffer,
+                                                   0);
+                if (!ok) return 0;
+                if (has_steering) {
+                    ok = ds4_gpu_encode_bin_f32_rows(cb,
+                                                       g_add_pipeline,
+                                                       &add_args,
+                                                       g_router_selection_buffer,
+                                                       0,
+                                                       steeringbuf,
+                                                       steering_off,
+                                                       g_router_selection_buffer,
+                                                       0);
+                    if (!ok) return 0;
+                }
+            } else {
+                ok = ds4_gpu_encode_bin_f32_rows(cb,
+                                                   g_add_pipeline,
+                                                   &add_args,
+                                                   probsbuf,
+                                                   probs_off,
+                                                   steeringbuf,
+                                                   steering_off,
+                                                   g_router_selection_buffer,
+                                                   0);
+                if (!ok) return 0;
+            }
 
             selection_view = [DS4MetalTensor new];
             selection_view.buffer = g_router_selection_buffer;
@@ -12580,7 +12616,9 @@ int ds4_gpu_router_select_tensor(
         uint32_t                n_group_used,
         bool                    has_bias,
         bool                    hash_mode,
-        const ds4_gpu_tensor *logits) {
+        const ds4_gpu_tensor *logits,
+        const ds4_gpu_tensor *expert_steering_bias,
+        uint32_t                expert_steering_layer) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!selected || !weights || !probs || !logits || !model_map) return 0;
     if (hash_mode && token >= hash_rows) return 0;
@@ -12627,6 +12665,13 @@ int ds4_gpu_router_select_tensor(
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         const int32_t token_i32 = (int32_t)token;
+        id<MTLBuffer> steeringbuf = nil;
+        NSUInteger steering_off = 0;
+        if (expert_steering_bias) {
+            steeringbuf = ds4_gpu_tensor_buffer(expert_steering_bias);
+            steering_off = (NSUInteger)ds4_gpu_tensor_offset(expert_steering_bias)
+                         + (NSUInteger)expert_steering_layer * 256u * sizeof(float);
+        }
         int ok = cb &&
                  ds4_gpu_encode_router_select(cb,
                                                       selected,
@@ -12644,7 +12689,9 @@ int ds4_gpu_router_select_tensor(
                                                       hash_rows,
                                                       1,
                                                       has_bias && !hash_mode,
-                                                      hash_mode);
+                                                      hash_mode,
+                                                      steeringbuf,
+                                                      steering_off);
         if (!had_batch) {
             ok = ds4_gpu_end_commands() != 0 && ok;
         }
@@ -12669,7 +12716,9 @@ int ds4_gpu_router_select_batch_tensor(
         bool                    hash_mode,
         const ds4_gpu_tensor *logits,
         const ds4_gpu_tensor *tokens,
-        uint32_t                n_tokens) {
+        uint32_t                n_tokens,
+        const ds4_gpu_tensor *expert_steering_bias,
+        uint32_t                expert_steering_layer) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0) return 0;
     if (n_expert_groups > 1u || n_group_used > 0u) {
@@ -12716,6 +12765,13 @@ int ds4_gpu_router_select_batch_tensor(
         if (!had_batch && ds4_gpu_begin_commands() == 0) return 0;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        id<MTLBuffer> steeringbuf = nil;
+        NSUInteger steering_off = 0;
+        if (expert_steering_bias) {
+            steeringbuf = ds4_gpu_tensor_buffer(expert_steering_bias);
+            steering_off = (NSUInteger)ds4_gpu_tensor_offset(expert_steering_bias)
+                         + (NSUInteger)expert_steering_layer * 256u * sizeof(float);
+        }
         int ok = cb &&
                  ds4_gpu_encode_router_select(cb,
                                                       selected,
@@ -12733,7 +12789,9 @@ int ds4_gpu_router_select_batch_tensor(
                                                       hash_rows,
                                                       n_tokens,
                                                       has_bias && !hash_mode,
-                                                      hash_mode);
+                                                      hash_mode,
+                                                      steeringbuf,
+                                                      steering_off);
         if (!had_batch) {
             ok = ds4_gpu_end_commands() != 0 && ok;
         }
