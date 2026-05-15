@@ -597,6 +597,9 @@ int ds4_gpu_router_select_tensor(
         uint32_t                n_group_used,
         bool                    has_bias,
         bool                    hash_mode,
+        const ds4_gpu_tensor *expert_steering,
+        uint32_t                layer,
+        float                   expert_steering_scale,
         const ds4_gpu_tensor *logits);
 
 int ds4_gpu_router_select_batch_tensor(
@@ -612,6 +615,9 @@ int ds4_gpu_router_select_batch_tensor(
         uint32_t                n_group_used,
         bool                    has_bias,
         bool                    hash_mode,
+        const ds4_gpu_tensor *expert_steering,
+        uint32_t                layer,
+        float                   expert_steering_scale,
         const ds4_gpu_tensor *logits,
         const ds4_gpu_tensor *tokens,
         uint32_t                n_tokens);

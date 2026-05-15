@@ -11,6 +11,15 @@ y = y - scale * direction[layer] * dot(direction[layer], y)
 Positive scale removes the represented direction. Negative scale amplifies it.
 With no steering file or zero scales, ds4 follows the normal inference path.
 
+DS4 also supports routed MoE expert steering, which promotes or suppresses
+behavior-associated experts at router time using a separate `43 x 256` f32 map.
+See [EXPERT_STEERING.md](EXPERT_STEERING.md) for the SteerMoE-style builder,
+runtime flags, and examples. See [STEERING_LEVERS.md](STEERING_LEVERS.md) for a
+combined guide covering both levers, when to use each one, and how to pass the
+files to `ds4` or `ds4-server` individually or together. A short PR-oriented
+summary is in [STEERING_PR_SUMMARY.md](STEERING_PR_SUMMARY.md). The two
+steering systems are independent and can be combined.
+
 ## Runtime Options
 
 ```text
