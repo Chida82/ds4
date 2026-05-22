@@ -601,14 +601,15 @@ static void test_server_concurrent_requests_stream_sequentially(void) {
         TEST_ASSERT(line_count < 150);
     }
 
-    server_log(DS4_LOG_DEFAULT,
-               "ds4-test: concurrent compare req_gap_ms=500 req2_sent_before_req1_finish=%d req2_first_byte_before_req1_finish=%d",
-               caps[1].send_done_at < caps[0].last_byte_at ? 1 : 0,
-               caps[1].first_byte_at < caps[0].last_byte_at ? 1 : 0);
     test_log_stream_capture_server("req1", &caps[0], caps[0].raw.ptr ? caps[0].raw.ptr : "");
     test_log_stream_capture_server("req2", &caps[1], caps[1].raw.ptr ? caps[1].raw.ptr : "");
     test_log_stream_timing_summary_server("req1", &caps[0]);
     test_log_stream_timing_summary_server("req2", &caps[1]);
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-test: concurrent compare req_gap_ms=500 req1_last_byte_ts=%.6f req2_first_byte_ts=%.6f sequential=%d",
+               caps[0].last_byte_at,
+               caps[1].first_byte_at,
+               caps[1].first_byte_at > caps[0].last_byte_at ? 1 : 0);
 
     buf_free(&caps[0].raw);
     buf_free(&caps[1].raw);
