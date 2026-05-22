@@ -10636,8 +10636,8 @@ static job *dequeue_ready(server *s) {
 
 static bool batch_job_supported(const job *j) {
     const request *r = j ? &j->req : NULL;
-    return r && r->stream && r->api == API_OPENAI && !r->has_tools &&
-           !ds4_think_mode_enabled(r->think_mode) &&
+    return r && r->stream && r->api == API_OPENAI && //!r->has_tools &&
+           //!ds4_think_mode_enabled(r->think_mode) &&
            (r->kind == REQ_CHAT || r->kind == REQ_COMPLETION);
 }
 
