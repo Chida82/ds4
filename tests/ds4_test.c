@@ -216,7 +216,8 @@ static void test_server_cleanup_keep_engine(server *s) {
     memset(s, 0, sizeof(*s));
 }
 
-static void test_server_init_live(server *s, ds4_engine *engine, int ctx_size) {
+static void test_server_init_live(server *s, ds4_engine *engine, int ctx_size,
+                                  const char *trace_path) {
     memset(s, 0, sizeof(*s));
     s->engine = engine;
     s->default_tokens = 256;
@@ -228,6 +229,13 @@ static void test_server_init_live(server *s, ds4_engine *engine, int ctx_size) {
     pthread_cond_init(&s->clients_cv, NULL);
     pthread_mutex_init(&s->tool_mu, NULL);
     pthread_mutex_init(&s->trace_mu, NULL);
+    if (trace_path) {
+        s->trace = fopen(trace_path, "w");
+        TEST_ASSERT(s->trace != NULL);
+        if (!s->trace) return;
+        setvbuf(s->trace, NULL, _IONBF, 0);
+        server_log(DS4_LOG_DEFAULT, "ds4-server: tracing session to %s", trace_path);
+    }
 }
 
 typedef struct {
@@ -447,6 +455,8 @@ static const char test_server_word_filter_prompt[] =
     "Ti passo una lista di parole. Di queste elencami le parole, solo quelle, senza altri frasi di spiegazione, che iniziano per il carattere c. una parola per ogni linea, mi aspetto 50 linee perche' abbimoa 50 parole che soddisfano il requisito.\n"
     "cable cactus camera candle cannon canvas captain carbon castle catalog celery center ceremony champion channel chapter charity cheetah cherry chimney chorus circle citizen clarity classic climate closet cluster coastal coconut coffee college comfort comic compass concert condor control cookie corner cotton country courage cradle crystal culture curtain custom cyclone cylinder able about above absurd adapt admit adult afraid agent agree airport album alert alien alley almost alpha always amber amount anchor angel animal answer anyone apart april arena argue arise around artist aspect attack august author autumn avenue await banana barrel basket battle beauty behalf behind belief belong benefit beyond binary bishop blanket border borrow bottle bottom branch breeze bridge bright broken budget buffer bullet bundle button buyer damage danger daring debate decade defeat defend define degree demand depart depend desert design detail device dialog differ dinner direct disease display distant divide dollar domain dragon drawer dream driven during eager early earth easily editor effect effort eighth either elder elegant element elite embark emotion empire enable ending energy engine enjoy enough ensure entire envelope episode equal escape estate ethics evening fabric factor failure fairly family famous father feature fellow female fiction filter final finger finish fiscal flavor flight flower follow forest formal forward fragile freedom friday future galaxy gallery garden gather general gentle genuine gesture ginger global golden govern grammar harbor harmony hazard height hidden holiday honest hunger hybrid ideal ignore illegal imagine impact import improve include infant inform inherit initial inquiry inside inspire instead intense island jacket jungle kernel ladder language lawyer leader legend liberty light linear little magnet manager manual market master matter memory mental middle minute modern monkey mother mountain musical mystery narrow nation native nature nearby normal notice number object office online open opera option oral order organ origin output owner panel paper parent part party phase phone photo piano piece pilot place plain plane plant plate player point power press price prime print prior prize proof proud prove public punch pupil radio range rapid ratio ready realm reason reply report result retail review river round route royal rural scale share shift shirt shock short signal silver simple single sister skill sleep slide small smart smile solid solve sorry sound south space speak speed spend split sport staff stage stand start state steam steel stock stone store story style sugar suite super sweet table taste teach thank theme thick thing think third those throw tiger title today topic total touch tough tower trade train treat trend trial trust truth twice union unity value video virus visit vital voice waste watch water wheel where which while white whole woman world worry worth write wrong yield young youth";
 
+static const char test_server_trace_path[] = "/tmp/ds4-trace.txt";
+
 static char *test_server_word_filter_prompt_dup(void) {
     return xstrdup(test_server_word_filter_prompt);
 }
@@ -470,7 +480,7 @@ static void test_server_single_request_word_filter(void) {
     int sv[2] = {-1, -1};
     test_stream_capture cap = {.fd = -1};
 
-    test_server_init_live(&s, engine, 4096);
+    test_server_init_live(&s, engine, 4096, NULL);
     if (!s.session) {
         free(http_req);
         free(prompt);
@@ -540,7 +550,7 @@ static void test_server_concurrent_requests_stream_sequentially(void) {
     int sv[2][2] = {{-1, -1}, {-1, -1}};
     test_stream_capture caps[2] = {{.fd = -1}, {.fd = -1}};
 
-    test_server_init_live(&s, engine, 4096);
+    test_server_init_live(&s, engine, 4096, test_server_trace_path);
     if (!s.session) {
         free(http_req);
         free(prompt);
