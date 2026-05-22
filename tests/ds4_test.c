@@ -556,6 +556,8 @@ static void test_server_concurrent_requests_stream_sequentially(void) {
         free(prompt);
         return;
     }
+    s.batching = true;
+    s.batch_size = 2;
     TEST_ASSERT(pthread_create(&worker, NULL, worker_main, &s) == 0);
 
     for (int i = 0; i < 2; i++) {
@@ -610,6 +612,8 @@ static void test_server_concurrent_requests_stream_sequentially(void) {
                caps[0].last_byte_at,
                caps[1].first_byte_at,
                caps[1].first_byte_at > caps[0].last_byte_at ? 1 : 0);
+    TEST_ASSERT(caps[1].first_byte_at > 0.0);
+    TEST_ASSERT(caps[0].last_byte_at > caps[1].first_byte_at);
 
     buf_free(&caps[0].raw);
     buf_free(&caps[1].raw);
