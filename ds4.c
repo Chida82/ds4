@@ -17780,6 +17780,20 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     return ds4_session_eval_internal(s, token, true, err, errlen);
 }
 
+int ds4_session_eval_batch(ds4_session_eval_batch_item *items, int n_items) {
+    if (!items || n_items <= 0) return 0;
+    int failed = 0;
+    for (int item_idx = 0; item_idx < n_items; item_idx++) {
+        ds4_session_eval_batch_item *item = &items[item_idx];
+        item->result = ds4_session_eval(item->session,
+                                        item->token,
+                                        item->err,
+                                        item->errlen);
+        if (item->result != 0) failed++;
+    }
+    return failed;
+}
+
 /* Speculative decode state machine:
  * 1. commit the normal target token and use its logits to validate draft[0];
  * 2. let MTP recursively draft a tiny suffix from its own raw-cache frontier;

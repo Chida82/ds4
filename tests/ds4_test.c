@@ -451,6 +451,51 @@ static void test_drive_two_streams(test_stream_capture *a,
     }
 }
 
+static void test_drive_three_streams(test_stream_capture *a,
+                                     test_stream_capture *b,
+                                     test_stream_capture *c) {
+    struct pollfd pfds[3];
+    double start = now_sec();
+
+    memset(pfds, 0, sizeof(pfds));
+    pfds[0].fd = a->fd;
+    pfds[0].events = POLLIN | POLLHUP;
+    pfds[1].fd = b->fd;
+    pfds[1].events = POLLIN | POLLHUP;
+    pfds[2].fd = c->fd;
+    pfds[2].events = POLLIN | POLLHUP;
+
+    while (!a->eof || !b->eof || !c->eof) {
+        int rc = poll(pfds, 3, 1000);
+        if (rc < 0 && errno == EINTR) continue;
+        TEST_ASSERT(rc >= 0);
+        TEST_ASSERT(now_sec() - start < 180.0);
+        if (rc <= 0) continue;
+
+        for (int i = 0; i < 3; i++) {
+            test_stream_capture *cap = i == 0 ? a : (i == 1 ? b : c);
+            if (cap->eof) continue;
+            if (!(pfds[i].revents & (POLLIN | POLLHUP))) continue;
+            for (;;) {
+                char tmp[4096];
+                ssize_t n = recv(cap->fd, tmp, sizeof(tmp), 0);
+                if (n < 0 && errno == EINTR) continue;
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                TEST_ASSERT(n >= 0);
+                if (n < 0) {
+                    test_stream_capture_close(cap);
+                    break;
+                }
+                if (n == 0) {
+                    test_stream_capture_close(cap);
+                    break;
+                }
+                test_stream_capture_append(cap, tmp, (size_t)n);
+            }
+        }
+    }
+}
+
 static const char test_server_word_filter_prompt[] =
     "Ti passo una lista di parole. Di queste elencami le parole, solo quelle, senza altri frasi di spiegazione, che iniziano per il carattere c. una parola per ogni linea, mi aspetto 50 linee perche' abbimoa 50 parole che soddisfano il requisito.\n"
     "cable cactus camera candle cannon canvas captain carbon castle catalog celery center ceremony champion channel chapter charity cheetah cherry chimney chorus circle citizen clarity classic climate closet cluster coastal coconut coffee college comfort comic compass concert condor control cookie corner cotton country courage cradle crystal culture curtain custom cyclone cylinder able about above absurd adapt admit adult afraid agent agree airport album alert alien alley almost alpha always amber amount anchor angel animal answer anyone apart april arena argue arise around artist aspect attack august author autumn avenue await banana barrel basket battle beauty behalf behind belief belong benefit beyond binary bishop blanket border borrow bottle bottom branch breeze bridge bright broken budget buffer bullet bundle button buyer damage danger daring debate decade defeat defend define degree demand depart depend desert design detail device dialog differ dinner direct disease display distant divide dollar domain dragon drawer dream driven during eager early earth easily editor effect effort eighth either elder elegant element elite embark emotion empire enable ending energy engine enjoy enough ensure entire envelope episode equal escape estate ethics evening fabric factor failure fairly family famous father feature fellow female fiction filter final finger finish fiscal flavor flight flower follow forest formal forward fragile freedom friday future galaxy gallery garden gather general gentle genuine gesture ginger global golden govern grammar harbor harmony hazard height hidden holiday honest hunger hybrid ideal ignore illegal imagine impact import improve include infant inform inherit initial inquiry inside inspire instead intense island jacket jungle kernel ladder language lawyer leader legend liberty light linear little magnet manager manual market master matter memory mental middle minute modern monkey mother mountain musical mystery narrow nation native nature nearby normal notice number object office online open opera option oral order organ origin output owner panel paper parent part party phase phone photo piano piece pilot place plain plane plant plate player point power press price prime print prior prize proof proud prove public punch pupil radio range rapid ratio ready realm reason reply report result retail review river round route royal rural scale share shift shirt shock short signal silver simple single sister skill sleep slide small smart smile solid solve sorry sound south space speak speed spend split sport staff stage stand start state steam steel stock stone store story style sugar suite super sweet table taste teach thank theme thick thing think third those throw tiger title today topic total touch tough tower trade train treat trend trial trust truth twice union unity value video virus visit vital voice waste watch water wheel where which while white whole woman world worry worth write wrong yield young youth";
@@ -620,6 +665,101 @@ static void test_server_concurrent_requests_stream_sequentially(void) {
     test_server_cleanup_keep_engine(&s);
     free(http_req);
     free(prompt);
+}
+
+static void test_server_concurrent_requests_stream_distinct(void) {
+    const char *prompts[3] = {
+        "Explain how continuous batching differs from simple request queueing.",
+        "Compare vLLM, llama.cpp, and DS4 in terms of serving throughput.",
+        "Describe three reasons a multi-agent workload can become serialized."
+    };
+    char *http_reqs[3] = {NULL, NULL, NULL};
+    pthread_t client_threads[3];
+    int sv[3][2] = {{-1, -1}, {-1, -1}, {-1, -1}};
+    test_stream_capture caps[3] = {{.fd = -1}, {.fd = -1}, {.fd = -1}};
+
+    for (int i = 0; i < 3; i++) {
+        http_reqs[i] = test_build_chat_http_request(prompts[i], true);
+        TEST_ASSERT(http_reqs[i] != NULL);
+        if (!http_reqs[i]) {
+            for (int j = 0; j < i; j++) free(http_reqs[j]);
+            return;
+        }
+    }
+
+    ds4_engine *engine = test_get_engine(false);
+    server s;
+    pthread_t worker;
+
+    test_server_init_live(&s, engine, 4096, test_server_trace_path);
+    if (!s.session) {
+        for (int i = 0; i < 3; i++) free(http_reqs[i]);
+        return;
+    }
+    s.batching = true;
+    s.batch_size = 3;
+    TEST_ASSERT(pthread_create(&worker, NULL, worker_main, &s) == 0);
+
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv[i]) == 0);
+        if (sv[i][0] < 0 || sv[i][1] < 0) continue;
+        configure_client_socket(sv[i][0]);
+        test_send_all_or_fail(sv[i][1], http_reqs[i], strlen(http_reqs[i]));
+        shutdown(sv[i][1], SHUT_WR);
+        caps[i].send_done_at = test_wall_sec();
+        test_set_nonblocking_or_fail(sv[i][1]);
+        caps[i].fd = sv[i][1];
+
+        client_arg *ca = xmalloc(sizeof(*ca));
+        ca->srv = &s;
+        ca->fd = sv[i][0];
+        TEST_ASSERT(pthread_create(&client_threads[i], NULL, client_main, ca) == 0);
+
+        if (i < 2) test_sleep_ms(250);
+    }
+
+    test_drive_three_streams(&caps[0], &caps[1], &caps[2]);
+
+    for (int i = 0; i < 3; i++) {
+        pthread_join(client_threads[i], NULL);
+    }
+    pthread_mutex_lock(&s.mu);
+    s.stopping = true;
+    pthread_cond_broadcast(&s.cv);
+    pthread_mutex_unlock(&s.mu);
+    pthread_join(worker, NULL);
+
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT(caps[i].raw.ptr != NULL);
+        TEST_ASSERT(caps[i].saw_bytes);
+        TEST_ASSERT(caps[i].saw_done);
+        TEST_ASSERT(caps[i].raw.ptr && strstr(caps[i].raw.ptr, "HTTP/1.1 200 OK") != NULL);
+        TEST_ASSERT(caps[i].last_byte_at > 0.0);
+    }
+    TEST_ASSERT(caps[1].first_byte_at > 0.0);
+    TEST_ASSERT(caps[2].first_byte_at > 0.0);
+    TEST_ASSERT(caps[0].last_byte_at > caps[1].first_byte_at);
+    TEST_ASSERT(caps[0].last_byte_at > caps[2].first_byte_at);
+
+    test_log_stream_capture_server("req1", &caps[0], caps[0].raw.ptr ? caps[0].raw.ptr : "");
+    test_log_stream_capture_server("req2", &caps[1], caps[1].raw.ptr ? caps[1].raw.ptr : "");
+    test_log_stream_capture_server("req3", &caps[2], caps[2].raw.ptr ? caps[2].raw.ptr : "");
+    test_log_stream_timing_summary_server("req1", &caps[0]);
+    test_log_stream_timing_summary_server("req2", &caps[1]);
+    test_log_stream_timing_summary_server("req3", &caps[2]);
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-test: concurrent distinct compare req1_last_byte_ts=%.6f req2_first_byte_ts=%.6f req3_first_byte_ts=%.6f overlap12=%d overlap13=%d",
+               caps[0].last_byte_at,
+               caps[1].first_byte_at,
+               caps[2].first_byte_at,
+               caps[0].last_byte_at > caps[1].first_byte_at ? 1 : 0,
+               caps[0].last_byte_at > caps[2].first_byte_at ? 1 : 0);
+
+    for (int i = 0; i < 3; i++) {
+        buf_free(&caps[i].raw);
+        free(http_reqs[i]);
+    }
+    test_server_cleanup_keep_engine(&s);
 }
 
 typedef struct {
@@ -1097,6 +1237,7 @@ static void test_server_unit_group(void) {
 #ifndef DS4_NO_GPU
     test_server_single_request_word_filter();
     test_server_concurrent_requests_stream_sequentially();
+    test_server_concurrent_requests_stream_distinct();
 #endif
 }
 

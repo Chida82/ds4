@@ -7654,6 +7654,12 @@ struct job {
 
 typedef struct {
     job *j;
+    char id[96];
+    bool failed;
+} batch_fanout;
+
+typedef struct {
+    job *j;
     ds4_session *session;
     char id[96];
     char err[160];
@@ -7661,11 +7667,15 @@ typedef struct {
     size_t plain_stream_pos;
     size_t stop_scan_from;
     const char *finish;
+    bool done;
     int prompt_tokens;
     int completion;
     int max_tokens;
     uint64_t rng;
     double t0;
+    batch_fanout *fanout;
+    int fanout_len;
+    int fanout_cap;
 } batch_decode_job;
 
 /* =========================================================================
@@ -10641,6 +10651,59 @@ static bool batch_job_supported(const job *j) {
            (r->kind == REQ_CHAT || r->kind == REQ_COMPLETION);
 }
 
+static bool batch_str_eq(const char *a, const char *b) {
+    if (!a || !b) return a == b;
+    return strcmp(a, b) == 0;
+}
+
+static bool batch_stops_equal(const stop_list *a, const stop_list *b) {
+    if (a->len != b->len) return false;
+    for (int i = 0; i < a->len; i++) {
+        if (!batch_str_eq(a->v[i], b->v[i])) return false;
+    }
+    return true;
+}
+
+static bool batch_tokens_equal(const ds4_tokens *a, const ds4_tokens *b) {
+    if (a->len != b->len) return false;
+    return a->len == 0 || memcmp(a->v, b->v, (size_t)a->len * sizeof(a->v[0])) == 0;
+}
+
+static bool batch_requests_coalesceable(const request *a, const request *b) {
+    if (!a || !b) return false;
+    if (a->temperature > 0.0f || b->temperature > 0.0f) return false;
+    return a->kind == b->kind &&
+           a->api == b->api &&
+           a->stream == b->stream &&
+           a->stream_include_usage == b->stream_include_usage &&
+           a->max_tokens == b->max_tokens &&
+           a->top_k == b->top_k &&
+           a->temperature == b->temperature &&
+           a->top_p == b->top_p &&
+           a->min_p == b->min_p &&
+           a->seed == b->seed &&
+           a->think_mode == b->think_mode &&
+           a->has_tools == b->has_tools &&
+           batch_str_eq(a->model, b->model) &&
+           batch_stops_equal(&a->stops, &b->stops) &&
+           batch_tokens_equal(&a->prompt, &b->prompt);
+}
+
+static bool batch_open_stream(server *s, job *j, char id[96], char *err, size_t errlen) {
+    snprintf(id, 96, "%s-%llu",
+             j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
+             (unsigned long long)++s->seq);
+    if (!sse_headers(j->fd, s->enable_cors)) {
+        snprintf(err, errlen, "client stream write failed");
+        return false;
+    }
+    if (j->req.kind == REQ_CHAT && !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
+        snprintf(err, errlen, "client stream write failed");
+        return false;
+    }
+    return true;
+}
+
 static bool batch_decode_start(server *s, batch_decode_job *b, job *j) {
     memset(b, 0, sizeof(*b));
     b->j = j;
@@ -10658,17 +10721,7 @@ static bool batch_decode_start(server *s, batch_decode_job *b, job *j) {
         http_error(j->fd, s->enable_cors, 500, b->err[0] ? b->err : "prefill failed");
         return false;
     }
-    snprintf(b->id, sizeof(b->id), "%s-%llu",
-             j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
-             (unsigned long long)++s->seq);
-    if (!sse_headers(j->fd, s->enable_cors)) {
-        snprintf(b->err, sizeof(b->err), "client stream write failed");
-        return false;
-    }
-    if (j->req.kind == REQ_CHAT && !sse_chunk(j->fd, &j->req, b->id, NULL, NULL)) {
-        snprintf(b->err, sizeof(b->err), "client stream write failed");
-        return false;
-    }
+    if (!batch_open_stream(s, j, b->id, b->err, sizeof(b->err))) return false;
     int room = ds4_session_ctx(b->session) - ds4_session_pos(b->session);
     b->max_tokens = j->req.max_tokens;
     if (b->max_tokens < 0) b->max_tokens = 0;
@@ -10684,7 +10737,44 @@ static bool batch_decode_start(server *s, batch_decode_job *b, job *j) {
     return true;
 }
 
-static bool batch_decode_step(server *s, batch_decode_job *b) {
+static bool batch_decode_attach_fanout(server *s, batch_decode_job *b, job *j) {
+    if (!batch_requests_coalesceable(&b->j->req, &j->req)) return false;
+    if (b->fanout_len == b->fanout_cap) {
+        b->fanout_cap = b->fanout_cap ? b->fanout_cap * 2 : 2;
+        b->fanout = xrealloc(b->fanout, (size_t)b->fanout_cap * sizeof(b->fanout[0]));
+    }
+    batch_fanout *f = &b->fanout[b->fanout_len];
+    memset(f, 0, sizeof(*f));
+    f->j = j;
+    j->req.cache_read_tokens = b->j->req.cache_read_tokens;
+    j->req.cache_write_tokens = b->j->req.cache_write_tokens;
+    char err[160];
+    err[0] = '\0';
+    if (!batch_open_stream(s, j, f->id, err, sizeof(err))) return false;
+    if (b->plain_stream_pos > 0) {
+        char *prefix = xstrndup(b->text.ptr, b->plain_stream_pos);
+        bool ok = sse_chunk(j->fd, &j->req, f->id, prefix, NULL);
+        free(prefix);
+        if (!ok) return false;
+    }
+    b->fanout_len++;
+    server_log(DS4_LOG_GENERATION,
+               "ds4-server: batching coalesced duplicate prompt=%d generated=%d fanout=%d",
+               b->prompt_tokens,
+               b->completion,
+               b->fanout_len + 1);
+    return true;
+}
+
+static void batch_decode_fanout_delta(batch_decode_job *b, const char *delta) {
+    for (int i = 0; i < b->fanout_len; i++) {
+        batch_fanout *f = &b->fanout[i];
+        if (f->failed) continue;
+        if (!sse_chunk(f->j->fd, &f->j->req, f->id, delta, NULL)) f->failed = true;
+    }
+}
+
+static bool batch_decode_sample_token(server *s, batch_decode_job *b, int *token_out) {
     job *j = b->j;
     if (b->completion >= b->max_tokens ||
         ds4_session_pos(b->session) >= ds4_session_ctx(b->session)) {
@@ -10698,11 +10788,12 @@ static bool batch_decode_step(server *s, batch_decode_job *b) {
         b->finish = "stop";
         return true;
     }
-    if (ds4_session_eval(b->session, token, b->err, sizeof(b->err)) != 0) {
-        b->finish = "error";
-        return true;
-    }
+    *token_out = token;
+    return false;
+}
 
+static bool batch_decode_emit_token(server *s, batch_decode_job *b, int token) {
+    job *j = b->j;
     size_t piece_len = 0;
     char *piece = ds4_token_text(s->engine, token, &piece_len);
     b->completion++;
@@ -10726,12 +10817,14 @@ static bool batch_decode_step(server *s, batch_decode_job *b) {
         char *delta = xstrndup(b->text.ptr + b->plain_stream_pos,
                                stream_len - b->plain_stream_pos);
         bool ok = sse_chunk(j->fd, &j->req, b->id, delta, NULL);
-        free(delta);
         if (!ok) {
+            free(delta);
             b->finish = "error";
             snprintf(b->err, sizeof(b->err), "client stream write failed");
             return true;
         }
+        batch_decode_fanout_delta(b, delta);
+        free(delta);
         b->plain_stream_pos = stream_len;
     }
     if (hit_stop) {
@@ -10745,9 +10838,48 @@ static bool batch_decode_step(server *s, batch_decode_job *b) {
     return b->completion >= b->max_tokens;
 }
 
+static void batch_decode_step_many(server *s,
+                                   batch_decode_job *active,
+                                   int nactive,
+                                   ds4_session_eval_batch_item *items,
+                                   int *item_job_indices,
+                                   int *item_tokens) {
+    int nitems = 0;
+    for (int active_idx = 0; active_idx < nactive; active_idx++) {
+        batch_decode_job *b = &active[active_idx];
+        if (b->done) continue;
+        int token = 0;
+        if (batch_decode_sample_token(s, b, &token)) {
+            b->done = true;
+            continue;
+        }
+        items[nitems].session = b->session;
+        items[nitems].token = token;
+        items[nitems].err = b->err;
+        items[nitems].errlen = sizeof(b->err);
+        items[nitems].result = 0;
+        item_job_indices[nitems] = active_idx;
+        item_tokens[nitems] = token;
+        nitems++;
+    }
+    if (nitems == 0) return;
+
+    (void)ds4_session_eval_batch(items, nitems);
+    for (int item_idx = 0; item_idx < nitems; item_idx++) {
+        batch_decode_job *b = &active[item_job_indices[item_idx]];
+        if (items[item_idx].result != 0) {
+            b->finish = "error";
+            b->done = true;
+            continue;
+        }
+        b->done = batch_decode_emit_token(s, b, item_tokens[item_idx]);
+    }
+}
+
 static void batch_decode_cleanup(batch_decode_job *b) {
     ds4_session_free(b->session);
     buf_free(&b->text);
+    free(b->fanout);
     memset(b, 0, sizeof(*b));
 }
 
@@ -10757,6 +10889,12 @@ static void batch_decode_finish(server *s, batch_decode_job *b) {
         char *tail = xstrndup(b->text.ptr + b->plain_stream_pos,
                               b->text.len - b->plain_stream_pos);
         if (!sse_chunk(j->fd, &j->req, b->id, tail, NULL)) b->finish = "error";
+        for (int i = 0; i < b->fanout_len; i++) {
+            batch_fanout *f = &b->fanout[i];
+            if (!f->failed && !sse_chunk(f->j->fd, &f->j->req, f->id, tail, NULL)) {
+                f->failed = true;
+            }
+        }
         free(tail);
     }
     if (j->req.stream) {
@@ -10764,6 +10902,16 @@ static void batch_decode_finish(server *s, batch_decode_job *b) {
             !sse_done(j->fd, &j->req, b->id, b->prompt_tokens, b->completion)) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: batching final stream failed");
+        }
+        for (int i = 0; i < b->fanout_len; i++) {
+            batch_fanout *f = &b->fanout[i];
+            if (!f->failed &&
+                (!sse_chunk(f->j->fd, &f->j->req, f->id, NULL, b->finish) ||
+                 !sse_done(f->j->fd, &f->j->req, f->id, b->prompt_tokens, b->completion))) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: batching coalesced final stream failed");
+            }
+            job_signal_done(f->j);
         }
     } else {
         final_response(j->fd, s->enable_cors, &j->req, b->id,
@@ -10806,6 +10954,20 @@ static bool worker_batch_admit(server *s, batch_decode_job *active, int *nactive
             admitted = true;
             continue;
         }
+        int coalesce_idx = -1;
+        for (int i = 0; i < *nactive; i++) {
+            if (batch_requests_coalesceable(&active[i].j->req, &j->req)) {
+                coalesce_idx = i;
+                break;
+            }
+        }
+        if (coalesce_idx >= 0) {
+            if (!batch_decode_attach_fanout(s, &active[coalesce_idx], j)) {
+                job_signal_done(j);
+            }
+            admitted = true;
+            continue;
+        }
         if (!batch_decode_start(s, &active[*nactive], j)) {
             batch_decode_cleanup(&active[*nactive]);
             job_signal_done(j);
@@ -10823,6 +10985,9 @@ static void *worker_main_batched(void *arg) {
     int cap = s->batch_size > 0 ? s->batch_size : 2;
     batch_decode_job *active = xmalloc((size_t)cap * sizeof(active[0]));
     memset(active, 0, (size_t)cap * sizeof(active[0]));
+    ds4_session_eval_batch_item *items = xmalloc((size_t)cap * sizeof(items[0]));
+    int *item_job_indices = xmalloc((size_t)cap * sizeof(item_job_indices[0]));
+    int *item_tokens = xmalloc((size_t)cap * sizeof(item_tokens[0]));
     int nactive = 0;
     server_log(DS4_LOG_DEFAULT,
                "ds4-server: continuous batching enabled batch_size=%d", cap);
@@ -10836,9 +11001,9 @@ static void *worker_main_batched(void *arg) {
             continue;
         }
         worker_batch_admit(s, active, &nactive, cap, false);
+        batch_decode_step_many(s, active, nactive, items, item_job_indices, item_tokens);
         for (int i = 0; i < nactive;) {
-            bool done = batch_decode_step(s, &active[i]);
-            if (!done) {
+            if (!active[i].done) {
                 i++;
                 continue;
             }
@@ -10848,6 +11013,9 @@ static void *worker_main_batched(void *arg) {
             batch_decode_remove(active, &nactive, i);
         }
     }
+    free(item_tokens);
+    free(item_job_indices);
+    free(items);
     free(active);
     return NULL;
 }

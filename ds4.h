@@ -175,6 +175,16 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+
+typedef struct {
+    ds4_session *session;
+    int token;
+    char *err;
+    size_t errlen;
+    int result;
+} ds4_session_eval_batch_item;
+
+int ds4_session_eval_batch(ds4_session_eval_batch_item *items, int n_items);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
