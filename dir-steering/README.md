@@ -94,6 +94,16 @@ python3 dir-steering/tools/run_sweep.py \
   --nothink
 ```
 
+`run_sweep.py` writes three files in `dir-steering/out` (or `--report-dir`):
+
+- `..._cases.csv`: one row per eval case and scale, including the model response text.
+- `..._summary.csv`: totals per scale split into `answered`, `refusal`, and `error`.
+- `..._inputs.zip`: the `good`, `bad`, and `eval` files used for the run.
+
+With `--dir-steering-ffn 0`, the steering term is multiplied by zero, so the
+result should match an unsteered run. Not passing a steering file at all is only
+useful if you want to avoid loading the steering artifact.
+
 Start with FFN scales between `-1` and `2`. If the model becomes repetitive,
 ignores the prompt, or starts losing factual content, the scale is too strong.
 For this example, `-1` is a good first terse setting and `2` is a good first
