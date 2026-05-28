@@ -11384,6 +11384,10 @@ static void usage(FILE *fp) {
         "      Load one f32 direction vector per layer for directional steering.\n"
         "  --dir-steering-ffn F\n"
         "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
+        "  --dir-steering-ffn-decay-tokens N\n"
+        "      Linearly move FFN steering scale to --dir-steering-ffn-decay-final after N generated tokens. Default: 0\n"
+        "  --dir-steering-ffn-decay-final F\n"
+        "      Final FFN steering scale after decay. Default: 0\n"
         "  --dir-steering-attn F\n"
         "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
@@ -11549,6 +11553,10 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
             c.engine.directional_steering_ffn = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-ffn-decay-tokens")) {
+            c.engine.directional_steering_ffn_decay_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dir-steering-ffn-decay-final")) {
+            c.engine.directional_steering_ffn_decay_final = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
         } else if (!strcmp(arg, "--dir-steering-attn")) {
             c.engine.directional_steering_attn = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;

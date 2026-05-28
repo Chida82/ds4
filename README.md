@@ -969,3 +969,47 @@ first answer:
   logit/model issues.
 - `ds4-server --trace` writes the rendered prompts, cache decisions, generated
   text, and tool-parser events for a whole agent session.
+
+## Teacher-Forced Steering
+
+The standard direction builder captures activations at the last prompt token,
+just before generation starts. Teacher-forced steering instead appends the
+beginning of the desired answer and captures activations there, so the vector
+is computed from the model state while it is already entering that response
+mode.
+
+In practice this often works better because part of the generic response-style
+signal is already consumed by the forced prefix, leaving more room for the
+direction to capture the latent knowledge or continuation state that should
+emerge from the model.
+
+Build a teacher-forced vector with:
+
+```sh
+python3 dir-steering/tools/build_direction_teacher_forced.py \
+  --ds4 ./ds4 \
+  --model ds4flash.gguf \
+  --good-file dir-steering/examples/teacher-forced/tiananmen_tf_good.txt \
+  --bad-file dir-steering/examples/teacher-forced/tiananmen_tf_bad.txt \
+  --out dir-steering/out/tiananmen_tf_3.json \
+  --component ffn_out \
+  --ctx 1024 \
+  --avg-last-k 3 \
+  --pair-normalize
+```
+
+Try it, for example, with:
+
+```sh
+./ds4 --seed 2026 --temp 0.1 \
+  --dir-steering-file dir-steering/out/tiananmen_tf_3.f32 \
+  --dir-steering-ffn -3 \
+  --dir-steering-ffn-decay-tokens 30 \
+  --dir-steering-ffn-decay-final -0.1 \
+  --nothink \
+  -p "Important events in China in 1989"
+```
+
+The `dir-steering` directory contains more notes and examples about how to
+prepare good/bad teacher-forced pairs.
+
