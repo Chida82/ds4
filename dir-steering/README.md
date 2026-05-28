@@ -16,12 +16,22 @@ With no steering file or zero scales, ds4 follows the normal inference path.
 ```text
 --dir-steering-file FILE   load a 43 x 4096 f32 direction file
 --dir-steering-ffn F       apply steering after FFN outputs; default is 1 when a file is provided
+--dir-steering-ffn-decay-tokens N
+                          linearly move FFN steering scale to the final value after N generated tokens
+--dir-steering-ffn-decay-final F
+                          final FFN steering scale after decay; default is 0
 --dir-steering-attn F      apply steering after attention outputs; default is 0
 ```
 
 The FFN output is usually the best first target because it is late enough in
 each layer to represent behavior, style, and topic signals. Attention steering
 is available for experiments, but it can be more fragile.
+
+With `--dir-steering-ffn-decay-tokens 0`, decay is disabled and ds4 keeps the
+current constant-scale behavior. For example, `--dir-steering-ffn -2
+--dir-steering-ffn-decay-tokens 20 --dir-steering-ffn-decay-final -0.1` starts
+the response at scale `-2`, reaches `-0.1` linearly after 20 generated tokens,
+and stays at `-0.1` afterward.
 
 ## Verbosity Example
 
@@ -149,3 +159,4 @@ Style control:
 The method is not a fine-tune. It is a low-rank runtime edit, so it works best
 for coarse behavior, topic, or style directions that are consistently present in
 the activation captures.
+
