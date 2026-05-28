@@ -411,6 +411,16 @@ static int parse_int(const char *s, const char *opt) {
     return (int)v;
 }
 
+static int parse_nonneg_int(const char *s, const char *opt) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (s[0] == '\0' || *end != '\0' || v < 0 || v > INT32_MAX) {
+        fprintf(stderr, "ds4-agent: invalid value for %s: %s\n", opt, s);
+        exit(2);
+    }
+    return (int)v;
+}
+
 static bool parse_power_percent(const char *arg, int *out) {
     char *end = NULL;
     long v = strtol(arg, &end, 10);
@@ -520,6 +530,8 @@ static void usage(FILE *fp) {
         "  --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n"
         "  --dir-steering-file FILE\n"
         "  --dir-steering-ffn F\n"
+        "  --dir-steering-ffn-decay-tokens N\n"
+        "  --dir-steering-ffn-decay-final F\n"
         "  --dir-steering-attn F\n"
         "  -h, --help             Show this help.\n"
         "\n"
@@ -631,6 +643,10 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
             c.engine.directional_steering_ffn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             steering_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-ffn-decay-tokens")) {
+            c.engine.directional_steering_ffn_decay_tokens = parse_nonneg_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dir-steering-ffn-decay-final")) {
+            c.engine.directional_steering_ffn_decay_final = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
         } else if (!strcmp(arg, "--dir-steering-attn")) {
             c.engine.directional_steering_attn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             steering_scale_set = true;

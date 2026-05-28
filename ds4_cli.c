@@ -110,6 +110,10 @@ static void usage(FILE *fp) {
         "      Load one f32 direction vector per layer for directional steering.\n"
         "  --dir-steering-ffn F\n"
         "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
+        "  --dir-steering-ffn-decay-tokens N\n"
+        "      Linearly move FFN steering scale to --dir-steering-ffn-decay-final after N generated tokens. Default: 0\n"
+        "  --dir-steering-ffn-decay-final F\n"
+        "      Final FFN steering scale after decay. Default: 0\n"
         "  --dir-steering-attn F\n"
         "      Apply steering after attention outputs. Default: 0\n"
         "  --warm-weights\n"
@@ -208,6 +212,16 @@ static int parse_int(const char *s, const char *opt) {
     char *end = NULL;
     long v = strtol(s, &end, 10);
     if (s[0] == '\0' || *end != '\0' || v <= 0 || v > INT32_MAX) {
+        fprintf(stderr, "ds4: invalid value for %s: %s\n", opt, s);
+        exit(2);
+    }
+    return (int)v;
+}
+
+static int parse_nonneg_int(const char *s, const char *opt) {
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (s[0] == '\0' || *end != '\0' || v < 0 || v > INT32_MAX) {
         fprintf(stderr, "ds4: invalid value for %s: %s\n", opt, s);
         exit(2);
     }
@@ -1481,6 +1495,10 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
             c.engine.directional_steering_ffn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-ffn-decay-tokens")) {
+            c.engine.directional_steering_ffn_decay_tokens = parse_nonneg_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dir-steering-ffn-decay-final")) {
+            c.engine.directional_steering_ffn_decay_final = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
         } else if (!strcmp(arg, "--dir-steering-attn")) {
             c.engine.directional_steering_attn = parse_float_range(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
