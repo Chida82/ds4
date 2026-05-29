@@ -11385,7 +11385,7 @@ static void usage(FILE *fp) {
         "  --dir-steering-ffn F\n"
         "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
         "  --dir-steering-ffn-decay-tokens N\n"
-        "      Linearly move FFN steering scale to --dir-steering-ffn-decay-final after N generated tokens. Default: 0\n"
+        "      Quadratically move FFN steering scale to --dir-steering-ffn-decay-final after N generated tokens. Default: 0\n"
         "  --dir-steering-ffn-decay-final F\n"
         "      Final FFN steering scale after decay. Default: 0\n"
         "  --dir-steering-attn F\n"
