@@ -11481,6 +11481,10 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dir-steering-ffn")) {
             c.engine.directional_steering_ffn = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-ffn-decay-tokens")) {
+            c.engine.directional_steering_ffn_decay_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dir-steering-ffn-decay-final")) {
+            c.engine.directional_steering_ffn_decay_final = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
         } else if (!strcmp(arg, "--dir-steering-attn")) {
             c.engine.directional_steering_attn = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
             directional_steering_scale_set = true;

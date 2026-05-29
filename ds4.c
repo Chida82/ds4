@@ -15834,7 +15834,8 @@ static float directional_steering_ffn_scale_at(
     if (decay_tokens <= 0) return start_scale;
     if (generated_tokens >= (uint32_t)decay_tokens) return final_scale;
     const float t = (float)generated_tokens / (float)decay_tokens;
-    return start_scale + (final_scale - start_scale) * t;
+    const float smooth = (3.0f * t * t) - (2.0f * t * t * t);
+    return start_scale + (final_scale - start_scale) * smooth;
 }
 
 static bool cpu_directional_steering_enabled(

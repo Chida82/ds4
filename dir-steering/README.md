@@ -17,7 +17,7 @@ With no steering file or zero scales, ds4 follows the normal inference path.
 --dir-steering-file FILE   load a 43 x 4096 f32 direction file
 --dir-steering-ffn F       apply steering after FFN outputs; default is 1 when a file is provided
 --dir-steering-ffn-decay-tokens N
-                          linearly move FFN steering scale to the final value after N generated tokens
+                          move FFN steering scale to the final value with a cubic smoothstep after N generated tokens
 --dir-steering-ffn-decay-final F
                           final FFN steering scale after decay; default is 0
 --dir-steering-attn F      apply steering after attention outputs; default is 0
@@ -30,8 +30,8 @@ is available for experiments, but it can be more fragile.
 With `--dir-steering-ffn-decay-tokens 0`, decay is disabled and ds4 keeps the
 current constant-scale behavior. For example, `--dir-steering-ffn -2
 --dir-steering-ffn-decay-tokens 20 --dir-steering-ffn-decay-final -0.1` starts
-the response at scale `-2`, reaches `-0.1` linearly after 20 generated tokens,
-and stays at `-0.1` afterward.
+the response at scale `-2`, follows a cubic smoothstep toward `-0.1`, reaches
+`-0.1` after 20 generated tokens, and stays at `-0.1` afterward.
 
 ## Verbosity Example
 
