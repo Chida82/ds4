@@ -107,6 +107,8 @@ typedef struct {
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_preload_experts;
+    const char *ssd_streaming_mirror_path;
+    uint32_t ssd_streaming_mirror_max_share;
     uint64_t simulate_used_memory_bytes;
     bool warm_weights;
     bool quality;

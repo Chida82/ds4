@@ -161,6 +161,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--ssd-streaming-cold", "Metal SSD streaming: skip default popularity-based expert-cache preload.");
     opt(fp, c, "--ssd-streaming-cache-experts N|NGB", "Metal SSD streaming: routed expert cache as expert count or GiB, e.g. 32GB. Default: 80% Metal working set minus non-routed weights.");
     opt(fp, c, "--ssd-streaming-preload-experts N", "Metal SSD streaming: upfront popularity preload count. Default: auto hot seed capped at 4096; use --ssd-streaming-cold to skip.");
+    opt(fp, c, "--ssd-streaming-mirror PATH", "Metal SSD streaming: byte-identical GGUF copy on a second SSD; expert reads spill onto it for more aggregate bandwidth. Verified at startup. Only helps when RAM < model size (page cache cannot absorb reads); on machines where the model fits in RAM it gives ~0 and may slightly hurt cold runs. Off by default.");
+    opt(fp, c, "--ssd-streaming-mirror-max-share PCT", "Metal SSD streaming: cap percent of each load the mirror may take, 0..100. Default: 0 (auto, favors the fast primary disk).");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
     opt(fp, c, "--prefill-chunk N", "Metal graph prefill chunk size. Default: auto (PRO long prompts use 8192; others use 4096).");
     if (full) {

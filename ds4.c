@@ -20535,6 +20535,9 @@ struct ds4_engine {
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
     uint32_t ssd_streaming_preload_experts;
+    char *ssd_streaming_mirror_path;
+    uint32_t ssd_streaming_mirror_max_share;
+    int mirror_fd;
     ds4_ssd_memory_lock simulated_memory;
     bool quality;
     bool ssd_streaming;
@@ -24200,10 +24203,105 @@ static bool ds4_engine_preload_pro_q4_expert_tables(
 #endif
 }
 
+/*
+ * Open and validate the streaming mirror: a byte-identical copy of the primary
+ * GGUF placed on a second, independent SSD. The streaming expert pread pool may
+ * spill overflow reads onto it, so every absolute file offset must name the
+ * same bytes on either disk. We require an exact size match, then memcmp a set
+ * of sampled regions (head, tail, and evenly spaced interior windows) of the
+ * mirror against the primary's existing mmap. Any mismatch fails startup rather
+ * than risk serving corrupt weights. Returns the mirror fd (>= 0) on success,
+ * or -1 on any failure (already logged).
+ */
+static int ds4_engine_open_mirror(const char *path, const ds4_model *primary) {
+    enum { DS4_MIRROR_WINDOW = 256u * 1024u, DS4_MIRROR_INTERIOR_WINDOWS = 8 };
+    if (!path || !path[0] || !primary || !primary->map || primary->size == 0) {
+        return -1;
+    }
+    int fd = open(path, O_RDONLY);
+    if (fd == -1) {
+        fprintf(stderr, "ds4: cannot open streaming mirror '%s': %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+    struct stat st;
+    if (fstat(fd, &st) == -1) {
+        fprintf(stderr, "ds4: cannot stat streaming mirror '%s': %s\n",
+                path, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if ((uint64_t)st.st_size != primary->size) {
+        fprintf(stderr,
+                "ds4: streaming mirror size mismatch '%s' (%llu bytes) vs primary "
+                "(%llu bytes); the mirror must be a byte-identical copy\n",
+                path,
+                (unsigned long long)st.st_size,
+                (unsigned long long)primary->size);
+        close(fd);
+        return -1;
+    }
+
+    uint8_t *buf = (uint8_t *)malloc(DS4_MIRROR_WINDOW);
+    if (!buf) {
+        fprintf(stderr, "ds4: out of memory verifying streaming mirror\n");
+        close(fd);
+        return -1;
+    }
+    const uint64_t size = primary->size;
+    const uint8_t *base = (const uint8_t *)primary->map;
+    const uint64_t step = size / (DS4_MIRROR_INTERIOR_WINDOWS + 1);
+    int ok = 1;
+    for (int i = 0; ok && i < DS4_MIRROR_INTERIOR_WINDOWS + 2; i++) {
+        uint64_t off;
+        if (i == 0) {
+            off = 0;                                                   /* head */
+        } else if (i == 1) {
+            off = size > DS4_MIRROR_WINDOW ? size - DS4_MIRROR_WINDOW : 0; /* tail */
+        } else {
+            off = step * (uint64_t)(i - 1);                       /* interior */
+            if (off + DS4_MIRROR_WINDOW > size) {
+                off = size > DS4_MIRROR_WINDOW ? size - DS4_MIRROR_WINDOW : 0;
+            }
+        }
+        const uint64_t want =
+            size - off < DS4_MIRROR_WINDOW ? size - off : DS4_MIRROR_WINDOW;
+        uint64_t pos = 0;
+        while (pos < want) {
+            ssize_t n;
+            do {
+                n = pread(fd, buf + pos, (size_t)(want - pos), (off_t)(off + pos));
+            } while (n < 0 && errno == EINTR);
+            if (n <= 0) {
+                fprintf(stderr,
+                        "ds4: streaming mirror read failed at offset %llu: %s\n",
+                        (unsigned long long)(off + pos), strerror(errno));
+                ok = 0;
+                break;
+            }
+            pos += (uint64_t)n;
+        }
+        if (ok && memcmp(buf, base + off, (size_t)want) != 0) {
+            fprintf(stderr,
+                    "ds4: streaming mirror content mismatch at offset %llu; the "
+                    "mirror is not a byte-identical copy of the primary GGUF\n",
+                    (unsigned long long)off);
+            ok = 0;
+        }
+    }
+    free(buf);
+    if (!ok) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     e->model.fd = -1;
     e->mtp_model.fd = -1;
+    e->mirror_fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
     e->ssd_streaming = opt->ssd_streaming;
@@ -24214,6 +24312,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
     e->ssd_streaming_cache_bytes = opt->ssd_streaming_cache_bytes;
     e->ssd_streaming_preload_experts = opt->ssd_streaming_preload_experts;
+    e->ssd_streaming_mirror_max_share = opt->ssd_streaming_mirror_max_share;
+    if (opt->ssd_streaming_mirror_path && opt->ssd_streaming_mirror_path[0]) {
+        e->ssd_streaming_mirror_path = ds4_strdup(opt->ssd_streaming_mirror_path);
+    }
     if (e->power_percent > 100) e->power_percent = 100;
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     if (e->mtp_draft_tokens > 16) e->mtp_draft_tokens = 16;
@@ -24372,6 +24474,26 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         }
         ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
         (void)ds4_gpu_set_model_fd(e->model.fd);
+        if (e->ssd_streaming_mirror_path && e->ssd_streaming_mirror_path[0]) {
+            if (!e->ssd_streaming) {
+                fprintf(stderr,
+                        "ds4: --ssd-streaming-mirror ignored without --ssd-streaming\n");
+            } else {
+                e->mirror_fd = ds4_engine_open_mirror(e->ssd_streaming_mirror_path,
+                                                      &e->model);
+                if (e->mirror_fd < 0) {
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+                (void)ds4_gpu_set_model_fd_mirror(e->mirror_fd);
+                ds4_gpu_set_streaming_mirror_max_share(e->ssd_streaming_mirror_max_share);
+                fprintf(stderr,
+                        "ds4: streaming mirror enabled '%s' (verified byte-identical, max_share=%u%%)\n",
+                        e->ssd_streaming_mirror_path,
+                        e->ssd_streaming_mirror_max_share);
+            }
+        }
         int model_map_ok = 0;
         uint64_t *load_offsets = NULL;
         uint64_t *load_sizes = NULL;
@@ -24601,6 +24723,10 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_threads_shutdown();
     if (e->mtp_ready) model_close(&e->mtp_model);
     model_close(&e->model);
+    if (e->mirror_fd >= 0) {
+        close(e->mirror_fd);
+        e->mirror_fd = -1;
+    }
 #ifndef DS4_NO_GPU
     ds4_gpu_cleanup();
 #endif
@@ -24608,6 +24734,7 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_release_instance_lock();
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
+    free(e->ssd_streaming_mirror_path);
     free(e);
 }
 

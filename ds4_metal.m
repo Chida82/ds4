@@ -172,6 +172,28 @@ static id<MTLBuffer> g_moe_q4_up_slots_buffer;
 static id<MTLBuffer> g_moe_q4_down_slots_buffer;
 static id<MTLBuffer> g_attn_out_group_ids_buffer;
 static int g_model_fd = -1;
+/*
+ * Optional mirror of the GGUF on a second, independent SSD (e.g. an external
+ * Thunderbolt drive). When set, routed-expert reads in the parallel pread pool
+ * can spill from the fast primary disk to this mirror to add aggregate read
+ * bandwidth. The mirror must be byte-identical to the primary so that every
+ * absolute file offset names the same bytes; the engine verifies this before
+ * installing the fd. -1 means "no mirror" and preserves the single-disk path.
+ */
+static int g_model_fd_mirror = -1;
+/*
+ * Mirror spill tuning. fast_depth is how many concurrent reads we keep on the
+ * primary disk before overflowing to the mirror; it also guards the batch tail
+ * so the last fast_depth reads always stay on the fast disk (avoids a slow
+ * mirror read becoming the straggler that the whole layer load waits on).
+ * max_share_pct optionally caps the fraction of one batch's reads the mirror
+ * may take (0 = no explicit cap, pure greedy proportioning by real speed).
+ */
+static uint32_t g_stream_mirror_max_share_pct;
+static uint64_t g_stream_mirror_pread_bytes;
+static uint64_t g_stream_mirror_pread_reads;
+static uint64_t g_stream_primary_pread_reads;
+static uint32_t ds4_gpu_stream_mirror_fast_depth(void);
 static const void *g_model_map_ptr;
 static uint64_t g_model_map_size;
 static uint64_t g_model_mapped_offset;
@@ -2497,6 +2519,20 @@ void ds4_gpu_print_memory_report(const char *label) {
                     ds4_gpu_gib(g_stream_expert_cache_mlock_fail_bytes),
                     (unsigned long long)g_stream_expert_cache_mlock_failures,
                     g_stream_expert_cache_mlock_ms);
+        }
+        if (g_model_fd_mirror >= 0 || g_stream_mirror_pread_reads != 0) {
+            const uint64_t total_reads =
+                g_stream_primary_pread_reads + g_stream_mirror_pread_reads;
+            const double mirror_read_share = total_reads ?
+                (double)g_stream_mirror_pread_reads / (double)total_reads : 0.0;
+            fprintf(stderr,
+                    "ds4:   streaming expert mirror reads primary=%llu mirror=%llu mirror_share=%.3f mirror_bytes=%.2f GiB fast_depth=%u max_share=%u%%\n",
+                    (unsigned long long)g_stream_primary_pread_reads,
+                    (unsigned long long)g_stream_mirror_pread_reads,
+                    mirror_read_share,
+                    ds4_gpu_gib(g_stream_mirror_pread_bytes),
+                    ds4_gpu_stream_mirror_fast_depth(),
+                    g_stream_mirror_max_share_pct);
         }
         if (ds4_gpu_stream_expert_timing_summary_enabled()) {
             const ds4_gpu_stream_expert_timing_snapshot total =
@@ -6352,6 +6388,12 @@ void ds4_gpu_cleanup(void) {
         g_selected_readback_event = nil;
         g_selected_readback_event_value = 0;
         [g_transient_buffers removeAllObjects];
+        if (getenv("DS4_METAL_MEMORY_REPORT") != NULL ||
+            getenv("DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY") != NULL ||
+            getenv("DS4_METAL_STREAMING_EXPERT_PROFILE_SUMMARY") != NULL ||
+            getenv("DS4_METAL_STREAMING_MIRROR_PROFILE") != NULL) {
+            ds4_gpu_print_memory_report("exit");
+        }
         ds4_gpu_stream_expert_pread_pool_shutdown();
         ds4_gpu_stream_expert_cache_clear_all(1);
         for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
@@ -6939,6 +6981,15 @@ int ds4_gpu_set_model_fd(int fd) {
     return 1;
 }
 
+int ds4_gpu_set_model_fd_mirror(int fd) {
+    g_model_fd_mirror = fd;
+    return 1;
+}
+
+void ds4_gpu_set_streaming_mirror_max_share(uint32_t pct) {
+    g_stream_mirror_max_share_pct = pct > 100u ? 100u : pct;
+}
+
 static int ds4_gpu_model_views_cover_range(
         const void *model_map,
         uint64_t    model_size,
@@ -7418,6 +7469,7 @@ static uint32_t ds4_gpu_stream_expert_pread_thread_count(uint32_t n_tasks) {
 }
 
 static int ds4_gpu_stream_expert_pread_into(
+        int       fd,
         uint64_t  offset,
         uint64_t  len,
         uint8_t  *dst,
@@ -7425,7 +7477,7 @@ static int ds4_gpu_stream_expert_pread_into(
         double   *ms_out) {
     if (read_bytes) *read_bytes = 0;
     if (ms_out) *ms_out = 0.0;
-    if (g_model_fd < 0 ||
+    if (fd < 0 ||
         !dst ||
         len == 0 ||
         offset > (uint64_t)LLONG_MAX ||
@@ -7441,7 +7493,7 @@ static int ds4_gpu_stream_expert_pread_into(
         const size_t want = rem > (uint64_t)SSIZE_MAX ? (size_t)SSIZE_MAX : (size_t)rem;
         ssize_t nread;
         do {
-            nread = pread(g_model_fd, dst + pos, want, (off_t)(offset + pos));
+            nread = pread(fd, dst + pos, want, (off_t)(offset + pos));
         } while (nread < 0 && errno == EINTR);
         if (nread <= 0) {
             ok = 0;
@@ -7468,7 +7520,8 @@ static void *ds4_gpu_stream_expert_pread_worker(void *arg) {
         (ds4_gpu_stream_expert_pread_worker_args *)arg;
     for (uint32_t i = wa->worker_index; i < wa->n_tasks; i += wa->n_workers) {
         ds4_gpu_stream_expert_pread_task *task = &wa->tasks[i];
-        task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
+        task->ok = ds4_gpu_stream_expert_pread_into(g_model_fd,
+                                                    task->offset,
                                                     task->len,
                                                     task->dst,
                                                     &task->read_bytes,
@@ -7490,10 +7543,85 @@ static uint64_t g_stream_expert_pread_pool_generation;
 static ds4_gpu_stream_expert_pread_task *g_stream_expert_pread_pool_tasks;
 static int g_stream_expert_pread_pool_initialized;
 static int g_stream_expert_pread_pool_stopping;
+/*
+ * Mirror spill accounting, all guarded by g_stream_expert_pread_pool_mutex and
+ * reset per dispatch in ds4_gpu_stream_expert_pread_pool_begin. in_flight_fast
+ * is the number of reads currently issued against the primary disk; the next
+ * read overflows to the mirror only once the primary is already kept busy.
+ */
+static uint32_t g_stream_expert_pread_pool_in_flight_fast;
+static uint32_t g_stream_expert_pread_pool_in_flight_mirror;
+static uint32_t g_stream_expert_pread_pool_mirror_assigned;
 
 static int ds4_gpu_stream_expert_pread_pool_enabled(void) {
     const char *env = getenv("DS4_METAL_STREAMING_EXPERT_PREAD_POOL");
     return !(env && strcmp(env, "0") == 0);
+}
+
+/*
+ * Concurrent primary-disk reads to sustain before spilling to the mirror. The
+ * same value guards the batch tail (see fd selection below). Default keeps
+ * about two thirds of the pool on the fast disk, leaving the rest to absorb
+ * overflow onto the mirror only on large loads.
+ */
+static uint32_t ds4_gpu_stream_mirror_fast_depth(void) {
+    const char *env = getenv("DS4_METAL_STREAMING_MIRROR_FAST_DEPTH");
+    if (env && env[0]) {
+        char *end = NULL;
+        const unsigned long v = strtoul(env, &end, 10);
+        if (end != env && *end == '\0' && v != 0) {
+            return v > 18u ? 18u : (uint32_t)v;
+        }
+    }
+    const uint32_t limit = ds4_gpu_stream_expert_pread_thread_limit();
+    uint32_t depth = (limit * 2u + 2u) / 3u;
+    if (depth == 0) depth = 1;
+    if (depth > limit) depth = limit;
+    return depth;
+}
+
+/*
+ * Per-batch cap on how many of this dispatch's tasks the mirror may take, from
+ * g_stream_mirror_max_share_pct. 0 means no explicit cap and we rely purely on
+ * the greedy in-flight rule, which already self-proportions to real bandwidth.
+ */
+static uint32_t ds4_gpu_stream_mirror_task_cap(uint32_t n_tasks) {
+    if (g_stream_mirror_max_share_pct == 0 || g_stream_mirror_max_share_pct >= 100) {
+        return n_tasks;
+    }
+    const uint64_t cap =
+        ((uint64_t)n_tasks * (uint64_t)g_stream_mirror_max_share_pct) / 100u;
+    return (uint32_t)cap;
+}
+
+/*
+ * Decide which disk a pulled task should read from. Called with the pool mutex
+ * held and the in-flight counters already reflecting reads in progress. The
+ * rule realizes "fill the fast disk first, spill the surplus to the mirror":
+ * stay on the primary unless it is already at fast_depth concurrent reads, and
+ * never offload the final fast_depth tasks of the batch so a slower mirror read
+ * cannot become the straggler the whole layer load waits on.
+ */
+static int ds4_gpu_stream_expert_pread_pick_fd(uint32_t task_index, int *used_mirror) {
+    *used_mirror = 0;
+    if (g_model_fd_mirror < 0) {
+        g_stream_expert_pread_pool_in_flight_fast++;
+        return g_model_fd;
+    }
+    const uint32_t n_tasks = g_stream_expert_pread_pool_n_tasks;
+    const uint32_t remaining = n_tasks - task_index; /* includes this task */
+    const uint32_t fast_depth = ds4_gpu_stream_mirror_fast_depth();
+    const uint32_t cap = ds4_gpu_stream_mirror_task_cap(n_tasks);
+    if (g_stream_expert_pread_pool_in_flight_fast >= fast_depth &&
+        remaining > fast_depth &&
+        g_stream_expert_pread_pool_mirror_assigned < cap) {
+        g_stream_expert_pread_pool_in_flight_mirror++;
+        g_stream_expert_pread_pool_mirror_assigned++;
+        *used_mirror = 1;
+        return g_model_fd_mirror;
+    }
+    g_stream_expert_pread_pool_in_flight_fast++;
+    return g_model_fd;
 }
 
 static void *ds4_gpu_stream_expert_pread_pool_worker(void *arg) {
@@ -7525,15 +7653,31 @@ static void *ds4_gpu_stream_expert_pread_pool_worker(void *arg) {
 
             ds4_gpu_stream_expert_pread_task *task =
                 &g_stream_expert_pread_pool_tasks[task_index];
+            int used_mirror = 0;
+            const int fd =
+                ds4_gpu_stream_expert_pread_pick_fd(task_index, &used_mirror);
             pthread_mutex_unlock(&g_stream_expert_pread_pool_mutex);
 
-            task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
+            task->ok = ds4_gpu_stream_expert_pread_into(fd,
+                                                        task->offset,
                                                         task->len,
                                                         task->dst,
                                                         &task->read_bytes,
                                                         &task->ms);
 
             pthread_mutex_lock(&g_stream_expert_pread_pool_mutex);
+            if (used_mirror) {
+                if (g_stream_expert_pread_pool_in_flight_mirror > 0) {
+                    g_stream_expert_pread_pool_in_flight_mirror--;
+                }
+                g_stream_mirror_pread_reads++;
+                g_stream_mirror_pread_bytes += task->read_bytes;
+            } else {
+                if (g_stream_expert_pread_pool_in_flight_fast > 0) {
+                    g_stream_expert_pread_pool_in_flight_fast--;
+                }
+                g_stream_primary_pread_reads++;
+            }
         }
 
         if (g_stream_expert_pread_pool_remaining_workers > 0 &&
@@ -7630,6 +7774,9 @@ static int ds4_gpu_stream_expert_pread_pool_begin(
     g_stream_expert_pread_pool_next_task = 0;
     g_stream_expert_pread_pool_active_workers = n_workers;
     g_stream_expert_pread_pool_remaining_workers = n_workers;
+    g_stream_expert_pread_pool_in_flight_fast = 0;
+    g_stream_expert_pread_pool_in_flight_mirror = 0;
+    g_stream_expert_pread_pool_mirror_assigned = 0;
     g_stream_expert_pread_pool_generation++;
     pthread_cond_broadcast(&g_stream_expert_pread_pool_start_cond);
     pthread_mutex_unlock(&g_stream_expert_pread_pool_mutex);

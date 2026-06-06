@@ -44,6 +44,12 @@ int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
+/* Optional second fd: a byte-identical mirror of the GGUF on an independent
+ * SSD. When set (>= 0), the streaming expert pread pool spills overflow reads
+ * onto it to raise aggregate bandwidth. Pass -1 to disable (single-disk path). */
+int ds4_gpu_set_model_fd_mirror(int fd);
+/* Cap, in percent, of one dispatch's reads the mirror may take (0 = no cap). */
+void ds4_gpu_set_streaming_mirror_max_share(uint32_t pct);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);

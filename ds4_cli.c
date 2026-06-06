@@ -1490,6 +1490,15 @@ static cli_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.ssd_streaming_preload_experts = (uint32_t)v;
+        } else if (!strcmp(arg, "--ssd-streaming-mirror")) {
+            c.engine.ssd_streaming_mirror_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--ssd-streaming-mirror-max-share")) {
+            int v = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (v < 0 || v > 100) {
+                fprintf(stderr, "ds4: --ssd-streaming-mirror-max-share must be 0..100\n");
+                exit(2);
+            }
+            c.engine.ssd_streaming_mirror_max_share = (uint32_t)v;
         } else if (!strcmp(arg, "--simulate-used-memory")) {
             if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
                                    &c.engine.simulate_used_memory_bytes)) {
