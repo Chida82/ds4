@@ -50,6 +50,11 @@ int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_mirror(int fd);
 /* Cap, in percent, of one dispatch's reads the mirror may take (0 = no cap). */
 void ds4_gpu_set_streaming_mirror_max_share(uint32_t pct);
+/* Auto-enable mirror spill during decode (used when the engine detects a
+ * disk-bound regime). DS4_METAL_STREAMING_MIRROR_DECODE=1/0 still overrides. */
+void ds4_gpu_set_streaming_mirror_decode_spill(int on);
+/* Physical RAM of the machine in bytes (0 if unavailable). */
+uint64_t ds4_gpu_physical_memory_bytes(void);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);

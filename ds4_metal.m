@@ -190,6 +190,7 @@ static int g_model_fd_mirror = -1;
  * may take (0 = no explicit cap, pure greedy proportioning by real speed).
  */
 static uint32_t g_stream_mirror_max_share_pct;
+static int g_stream_mirror_decode_spill_auto;
 static uint64_t g_stream_mirror_pread_bytes;
 static uint64_t g_stream_mirror_pread_reads;
 static uint64_t g_stream_primary_pread_reads;
@@ -6990,6 +6991,14 @@ void ds4_gpu_set_streaming_mirror_max_share(uint32_t pct) {
     g_stream_mirror_max_share_pct = pct > 100u ? 100u : pct;
 }
 
+void ds4_gpu_set_streaming_mirror_decode_spill(int on) {
+    g_stream_mirror_decode_spill_auto = on ? 1 : 0;
+}
+
+uint64_t ds4_gpu_physical_memory_bytes(void) {
+    return ds4_gpu_system_memory_bytes();
+}
+
 static int ds4_gpu_model_views_cover_range(
         const void *model_map,
         uint64_t    model_size,
@@ -7602,15 +7611,22 @@ static uint32_t ds4_gpu_stream_mirror_task_cap(uint32_t n_tasks) {
 }
 
 /*
- * Allow the mirror to spill during decode as well. Off by default: decode is
- * latency/compute-bound and a slower mirror only risks stragglers there for no
- * aggregate-bandwidth gain. Set DS4_METAL_STREAMING_MIRROR_DECODE=1 to
- * experiment on hardware whose primary disk is the bottleneck even for the
- * tiny single-token loads.
+ * Allow the mirror to spill during decode as well. Off by default because for a
+ * model that fits in RAM decode is latency/compute-bound and a slower mirror
+ * only risks stragglers. The engine turns this on automatically when it detects
+ * a disk-bound regime (model does not fit in available RAM), where decode reads
+ * really do hit the disk and the second SSD cuts the wait. Resolution order:
+ *   1. DS4_METAL_STREAMING_MIRROR_DECODE=1/0 forces on/off (explicit override).
+ *   2. otherwise the engine-provided auto flag
+ *      (ds4_gpu_set_streaming_mirror_decode_spill).
  */
 static int ds4_gpu_stream_mirror_decode_spill_enabled(void) {
     const char *env = getenv("DS4_METAL_STREAMING_MIRROR_DECODE");
-    return env && env[0] == '1' && env[1] == '\0';
+    if (env && env[0] && env[1] == '\0') {
+        if (env[0] == '1') return 1;
+        if (env[0] == '0') return 0;
+    }
+    return g_stream_mirror_decode_spill_auto;
 }
 
 /*

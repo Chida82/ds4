@@ -24479,19 +24479,71 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 fprintf(stderr,
                         "ds4: --ssd-streaming-mirror ignored without --ssd-streaming\n");
             } else {
-                e->mirror_fd = ds4_engine_open_mirror(e->ssd_streaming_mirror_path,
-                                                      &e->model);
-                if (e->mirror_fd < 0) {
-                    ds4_engine_close(e);
-                    *out = NULL;
-                    return 1;
+                /*
+                 * Regime detection. The mirror only helps when the model does
+                 * not fit in available RAM: otherwise the primary's reads are
+                 * served from the page cache (tens of GB/s) and diverting a
+                 * share to a physically slower second SSD only slows them down.
+                 * A byte is resident either in an mlock'd expert-cache buffer or
+                 * in the page cache, so the unique RAM footprint of the model is
+                 * just its file size; the cache budget cancels out. We compare
+                 * that file size against available RAM minus a reserve for the
+                 * KV cache, activations and the OS.
+                 */
+                const uint64_t phys = ds4_gpu_physical_memory_bytes();
+                const uint64_t sim = opt->simulate_used_memory_bytes;
+                const uint64_t effective_ram = phys > sim ? phys - sim : 0;
+                const uint64_t reserve = 8ull * 1024ull * 1024ull * 1024ull;
+                const uint64_t ram_budget =
+                    effective_ram > reserve ? effective_ram - reserve : 0;
+                const bool disk_bound =
+                    phys == 0 || e->model.size > ram_budget;
+                const char *force_env = getenv("DS4_METAL_STREAMING_MIRROR_FORCE");
+                const bool forced =
+                    force_env && force_env[0] == '1' && force_env[1] == '\0';
+
+                if (!disk_bound && !forced) {
+                    /*
+                     * A: model fits in RAM -> suppress the mirror. Keep the
+                     * single-disk path; the user can override with
+                     * DS4_METAL_STREAMING_MIRROR_FORCE=1.
+                     */
+                    fprintf(stderr,
+                            "ds4: streaming mirror auto-disabled: model %.1f GiB fits in "
+                            "available RAM %.1f GiB, so primary reads come from the page "
+                            "cache and a second disk would only slow them down "
+                            "(set DS4_METAL_STREAMING_MIRROR_FORCE=1 to override)\n",
+                            (double)e->model.size / 1073741824.0,
+                            (double)effective_ram / 1073741824.0);
+                } else {
+                    e->mirror_fd = ds4_engine_open_mirror(e->ssd_streaming_mirror_path,
+                                                          &e->model);
+                    if (e->mirror_fd < 0) {
+                        ds4_engine_close(e);
+                        *out = NULL;
+                        return 1;
+                    }
+                    (void)ds4_gpu_set_model_fd_mirror(e->mirror_fd);
+                    ds4_gpu_set_streaming_mirror_max_share(e->ssd_streaming_mirror_max_share);
+                    /*
+                     * B: spill prefill reads across both disks (the universal
+                     * win: +26%/+38% prefill/decode on Flash with limited RAM,
+                     * +5.7% prefill on Pro). Decode-spill stays OFF by default:
+                     * it only helps when decode itself is disk-bound (Flash
+                     * low-RAM, +5% more), but hurts when decode is bind-bound
+                     * (Pro: -6.5%, missing_wait 0.017 ms/layer vs 0.880 on
+                     * Flash low-RAM). Opt in with
+                     * DS4_METAL_STREAMING_MIRROR_DECODE=1 when decode is the
+                     * disk bottleneck.
+                     */
+                    ds4_gpu_set_streaming_mirror_decode_spill(0);
+                    fprintf(stderr,
+                            "ds4: streaming mirror enabled '%s' (verified byte-identical, "
+                            "max_share=%u%%, prefill-spill, decode_spill via "
+                            "DS4_METAL_STREAMING_MIRROR_DECODE=1)\n",
+                            e->ssd_streaming_mirror_path,
+                            e->ssd_streaming_mirror_max_share);
                 }
-                (void)ds4_gpu_set_model_fd_mirror(e->mirror_fd);
-                ds4_gpu_set_streaming_mirror_max_share(e->ssd_streaming_mirror_max_share);
-                fprintf(stderr,
-                        "ds4: streaming mirror enabled '%s' (verified byte-identical, max_share=%u%%)\n",
-                        e->ssd_streaming_mirror_path,
-                        e->ssd_streaming_mirror_max_share);
             }
         }
         int model_map_ok = 0;
