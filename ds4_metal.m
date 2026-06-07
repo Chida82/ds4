@@ -7553,16 +7553,29 @@ static uint32_t g_stream_expert_pread_pool_in_flight_fast;
 static uint32_t g_stream_expert_pread_pool_in_flight_mirror;
 static uint32_t g_stream_expert_pread_pool_mirror_assigned;
 
+/*
+ * Per-disk read-bandwidth estimates (bytes per millisecond), updated by the
+ * pool workers after every read and persisted across dispatches. They let the
+ * spill policy split a large load in proportion to each disk's measured speed
+ * and auto-adapt to a slower mirror (e.g. an external enclosure at half the
+ * internal NVMe rate) without a hand-tuned percentage. Guarded by
+ * g_stream_expert_pread_pool_mutex.
+ */
+static double g_stream_fast_bw_ewma;
+static double g_stream_mirror_bw_ewma;
+
 static int ds4_gpu_stream_expert_pread_pool_enabled(void) {
     const char *env = getenv("DS4_METAL_STREAMING_EXPERT_PREAD_POOL");
     return !(env && strcmp(env, "0") == 0);
 }
 
 /*
- * Concurrent primary-disk reads to sustain before spilling to the mirror. The
- * same value guards the batch tail (see fd selection below). Default keeps
- * about two thirds of the pool on the fast disk, leaving the rest to absorb
- * overflow onto the mirror only on large loads.
+ * Tail guard: how many of a dispatch's final tasks always stay on the fast
+ * primary, so a slower mirror read can never become the straggler the whole
+ * batch waits on. (This value was originally also an in-flight threshold; the
+ * proportional split below replaced that role.) Default 1 -- the proportional
+ * rule already balances the two disks so only the very last task needs
+ * protecting. Override with DS4_METAL_STREAMING_MIRROR_FAST_DEPTH.
  */
 static uint32_t ds4_gpu_stream_mirror_fast_depth(void) {
     const char *env = getenv("DS4_METAL_STREAMING_MIRROR_FAST_DEPTH");
@@ -7573,17 +7586,13 @@ static uint32_t ds4_gpu_stream_mirror_fast_depth(void) {
             return v > 18u ? 18u : (uint32_t)v;
         }
     }
-    const uint32_t limit = ds4_gpu_stream_expert_pread_thread_limit();
-    uint32_t depth = (limit * 2u + 2u) / 3u;
-    if (depth == 0) depth = 1;
-    if (depth > limit) depth = limit;
-    return depth;
+    return 1u;
 }
 
 /*
  * Per-batch cap on how many of this dispatch's tasks the mirror may take, from
- * g_stream_mirror_max_share_pct. 0 means no explicit cap and we rely purely on
- * the greedy in-flight rule, which already self-proportions to real bandwidth.
+ * g_stream_mirror_max_share_pct. 0 means no explicit cap and we let the
+ * bandwidth-weighted split decide the proportion.
  */
 static uint32_t ds4_gpu_stream_mirror_task_cap(uint32_t n_tasks) {
     if (g_stream_mirror_max_share_pct == 0 || g_stream_mirror_max_share_pct >= 100) {
@@ -7595,12 +7604,61 @@ static uint32_t ds4_gpu_stream_mirror_task_cap(uint32_t n_tasks) {
 }
 
 /*
+ * Minimum dispatch size (task count) before the mirror is used at all. The
+ * prefill phase issues a flood of small per-layer loads and is the only phase
+ * that spills to the mirror (see pick_fd's phase gate), so a small floor of 2
+ * lets essentially every prefill load contribute its bandwidth share. Decode
+ * loads are excluded by phase, not by size. Override with
+ * DS4_METAL_STREAMING_MIRROR_MIN_BATCH.
+ */
+static uint32_t ds4_gpu_stream_mirror_min_batch(void) {
+    const char *env = getenv("DS4_METAL_STREAMING_MIRROR_MIN_BATCH");
+    if (env && env[0]) {
+        char *end = NULL;
+        const unsigned long v = strtoul(env, &end, 10);
+        if (end != env && *end == '\0') {
+            return (uint32_t)v;
+        }
+    }
+    return 2u;
+}
+
+/*
+ * Allow the mirror to spill during decode as well. Off by default: decode is
+ * latency/compute-bound and a slower mirror only risks stragglers there for no
+ * aggregate-bandwidth gain. Set DS4_METAL_STREAMING_MIRROR_DECODE=1 to
+ * experiment on hardware whose primary disk is the bottleneck even for the
+ * tiny single-token loads.
+ */
+static int ds4_gpu_stream_mirror_decode_spill_enabled(void) {
+    const char *env = getenv("DS4_METAL_STREAMING_MIRROR_DECODE");
+    return env && env[0] == '1' && env[1] == '\0';
+}
+
+/*
+ * Fold one completed read into the per-disk bandwidth EWMA. Called by the pool
+ * worker under the mutex after the pread returns. Skips degenerate samples
+ * (zero bytes / non-positive time) that would distort the estimate.
+ */
+static void ds4_gpu_stream_expert_note_bw(int used_mirror, uint64_t bytes, double ms) {
+    if (bytes == 0 || ms <= 0.0) return;
+    const double bw = (double)bytes / ms; /* bytes per millisecond */
+    const double alpha = 0.125;
+    double *slot = used_mirror ? &g_stream_mirror_bw_ewma : &g_stream_fast_bw_ewma;
+    *slot = (*slot <= 0.0) ? bw : (*slot * (1.0 - alpha) + bw * alpha);
+}
+
+/*
  * Decide which disk a pulled task should read from. Called with the pool mutex
- * held and the in-flight counters already reflecting reads in progress. The
- * rule realizes "fill the fast disk first, spill the surplus to the mirror":
- * stay on the primary unless it is already at fast_depth concurrent reads, and
- * never offload the final fast_depth tasks of the batch so a slower mirror read
- * cannot become the straggler the whole layer load waits on.
+ * held. Policy: keep small (decode) loads entirely on the fast primary, and for
+ * large (prefill/bulk) loads split tasks in proportion to each disk's measured
+ * bandwidth. The split is deterministic on the assignment counters rather than
+ * on instantaneous in-flight depth: page-cache-served reads complete too fast
+ * to ever saturate the fast disk, so an in-flight-threshold rule leaves the
+ * mirror almost idle (measured ~1% share). A proportional counter instead
+ * tracks the bandwidth ratio regardless of how fast individual reads return.
+ * The final fast_depth tasks always stay on the primary so a slower mirror read
+ * cannot become the straggler that holds up the whole batch.
  */
 static int ds4_gpu_stream_expert_pread_pick_fd(uint32_t task_index, int *used_mirror) {
     *used_mirror = 0;
@@ -7608,17 +7666,49 @@ static int ds4_gpu_stream_expert_pread_pick_fd(uint32_t task_index, int *used_mi
         g_stream_expert_pread_pool_in_flight_fast++;
         return g_model_fd;
     }
+    /*
+     * Phase gate. Decode emits one token at a time: each layer issues a tiny
+     * expert load and stalls on its slowest read, yet the aggregate disk wait
+     * over a whole run is negligible (measured ~60 ms), so a second, slower
+     * disk cannot speed decode up -- it can only add a straggler. Decode
+     * therefore stays entirely on the fast primary. Prefill instead streams the
+     * bulk of the model from disk and is bandwidth-bound, so it is the only
+     * phase that spills onto the mirror. decode_tokens stays 0 until the first
+     * generated token (it is bumped at layer 0 of every decode step), cleanly
+     * marking the prefill phase. DS4_METAL_STREAMING_MIRROR_DECODE=1 forces
+     * spill in decode too for experimentation on unusual disk setups.
+     */
+    if (g_stream_expert_cache_decode_tokens != 0 &&
+        !ds4_gpu_stream_mirror_decode_spill_enabled()) {
+        g_stream_expert_pread_pool_in_flight_fast++;
+        return g_model_fd;
+    }
     const uint32_t n_tasks = g_stream_expert_pread_pool_n_tasks;
     const uint32_t remaining = n_tasks - task_index; /* includes this task */
-    const uint32_t fast_depth = ds4_gpu_stream_mirror_fast_depth();
+    const uint32_t tail_guard = ds4_gpu_stream_mirror_fast_depth();
+    const uint32_t min_batch = ds4_gpu_stream_mirror_min_batch();
     const uint32_t cap = ds4_gpu_stream_mirror_task_cap(n_tasks);
-    if (g_stream_expert_pread_pool_in_flight_fast >= fast_depth &&
-        remaining > fast_depth &&
+    if (n_tasks >= min_batch &&
+        remaining > tail_guard &&
         g_stream_expert_pread_pool_mirror_assigned < cap) {
-        g_stream_expert_pread_pool_in_flight_mirror++;
-        g_stream_expert_pread_pool_mirror_assigned++;
-        *used_mirror = 1;
-        return g_model_fd_mirror;
+        const uint32_t mirror_assigned = g_stream_expert_pread_pool_mirror_assigned;
+        const uint32_t fast_assigned = task_index - mirror_assigned;
+        double fast_bw = g_stream_fast_bw_ewma;
+        double mirror_bw = g_stream_mirror_bw_ewma;
+        if (fast_bw <= 0.0) fast_bw = 1.0;
+        if (mirror_bw <= 0.0) mirror_bw = fast_bw; /* seed: assume comparable */
+        /*
+         * Send this task to the mirror while its running share is still below
+         * its bandwidth fraction, i.e. while
+         *   mirror_assigned / fast_assigned < mirror_bw / fast_bw
+         * rearranged to avoid division by zero.
+         */
+        if ((double)mirror_assigned * fast_bw < (double)fast_assigned * mirror_bw) {
+            g_stream_expert_pread_pool_in_flight_mirror++;
+            g_stream_expert_pread_pool_mirror_assigned++;
+            *used_mirror = 1;
+            return g_model_fd_mirror;
+        }
     }
     g_stream_expert_pread_pool_in_flight_fast++;
     return g_model_fd;
@@ -7666,6 +7756,7 @@ static void *ds4_gpu_stream_expert_pread_pool_worker(void *arg) {
                                                         &task->ms);
 
             pthread_mutex_lock(&g_stream_expert_pread_pool_mutex);
+            ds4_gpu_stream_expert_note_bw(used_mirror, task->read_bytes, task->ms);
             if (used_mirror) {
                 if (g_stream_expert_pread_pool_in_flight_mirror > 0) {
                     g_stream_expert_pread_pool_in_flight_mirror--;
