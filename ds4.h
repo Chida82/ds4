@@ -105,6 +105,10 @@ typedef struct {
     float directional_steering_ffn;
     int directional_steering_ffn_decay_tokens;
     float directional_steering_ffn_decay_final;
+    const char *directional_steering_think_file;
+    float directional_steering_think_ffn;
+    int directional_steering_think_ffn_decay_tokens;
+    float directional_steering_think_ffn_decay_final;
     int power_percent;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
